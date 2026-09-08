@@ -4,6 +4,7 @@ package wifi
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -1405,5 +1406,1030 @@ func TestLinux_GetRegulatoryDomain_OK(t *testing.T) {
 
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Fatalf("unexpected region (-want +got):\n%s", diff)
+	}
+}
+
+// The devices below support two spatial streams: MCS 0-11 for HE, and every
+// EHT MCS range.
+var (
+	heMCS11NSS2 = [8]int{11, 11, -1, -1, -1, -1, -1, -1}
+
+	ehtMCS2NSS = []EHTMCSNSS{
+		{MinMCS: 0, MaxMCS: 9, RxMaxNSS: 2, TxMaxNSS: 2},
+		{MinMCS: 10, MaxMCS: 11, RxMaxNSS: 2, TxMaxNSS: 2},
+		{MinMCS: 12, MaxMCS: 13, RxMaxNSS: 2, TxMaxNSS: 2},
+	}
+)
+
+// Capability data captured from a MediaTek MT7925 (802.11be) device, for the
+// station interface type of its 2.4GHz and 6GHz bands.
+var (
+	mt7925HECapMAC = []byte{0x01, 0x08, 0x00, 0x1a, 0x40, 0x00}
+
+	// The kernel reports the PPE thresholds as a fixed-size buffer, so most
+	// of this is padding.
+	mt7925HECapPPE = []byte{
+		0x19, 0x1c, 0xc7, 0x71, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	}
+
+	// The HE-MCS maps for 80MHz, 160MHz and 80+80MHz channels: the device
+	// supports MCS 0-11 with one and two spatial streams.
+	mt7925HECapMCSSet = []byte{
+		0xfa, 0xff, 0xfa, 0xff,
+		0xfa, 0xff, 0xfa, 0xff,
+		0x00, 0x00, 0x00, 0x00,
+	}
+
+	// 40MHz in the 2.4GHz band, versus 40MHz, 80MHz and 160MHz in the 5GHz
+	// and 6GHz bands.
+	mt7925HECapPHY24GHz = []byte{
+		0x22, 0x70, 0xce, 0x12, 0x6d, 0xc0,
+		0xb3, 0x06, 0x4e, 0x3f, 0x00,
+	}
+	mt7925HECapPHY6GHz = []byte{
+		0x4c, 0x70, 0xce, 0x12, 0x6d, 0xc0,
+		0xb3, 0x06, 0x4e, 0x3f, 0x00,
+	}
+
+	mt7925EHTCapMAC = []byte{0x03, 0x00}
+	mt7925EHTCapPHY = []byte{
+		0xe8, 0x04, 0x09, 0xfe, 0x10,
+		0x61, 0x0c, 0x36, 0x00,
+	}
+)
+
+func TestLinux_parseBandIftypeData(t *testing.T) {
+	tests := []struct {
+		name    string
+		attrs   []netlink.Attribute
+		he      []HECapabilities
+		eht     []EHTCapabilities
+		wantErr error
+	}{
+		{
+			name: "no capabilities",
+			attrs: []netlink.Attribute{
+				{
+					Type: unix.NL80211_BAND_IFTYPE_ATTR_IFTYPES,
+					Data: mustMarshalAttributes([]netlink.Attribute{
+						{Type: uint16(InterfaceTypeStation)},
+					}),
+				},
+			},
+		},
+		{
+			name: "HE only",
+			attrs: []netlink.Attribute{
+				{
+					Type: unix.NL80211_BAND_IFTYPE_ATTR_IFTYPES,
+					Data: mustMarshalAttributes([]netlink.Attribute{
+						{Type: uint16(InterfaceTypeStation)},
+						{Type: uint16(InterfaceTypeAP)},
+					}),
+				},
+				{Type: unix.NL80211_BAND_IFTYPE_ATTR_HE_CAP_MAC, Data: mt7925HECapMAC},
+				{Type: unix.NL80211_BAND_IFTYPE_ATTR_HE_CAP_PHY, Data: mt7925HECapPHY24GHz},
+			},
+			he: []HECapabilities{{
+				InterfaceTypes:                     []InterfaceType{InterfaceTypeStation, InterfaceTypeAP},
+				HTCHE:                              true,
+				TriggerFrameMACPaddingDuration:     16,
+				OMControl:                          true,
+				MaxAMPDULengthExponentExt:          3,
+				AMSDUInAMPDU:                       true,
+				Support40MHzIn2GHz:                 true,
+				Support242ToneRUIn2GHz:             true,
+				DeviceClassA:                       true,
+				LDPCCodingInPayload:                true,
+				HESUPPDU1xHELTFAnd08usGI:           true,
+				NDP4xHELTFAnd32usGI:                true,
+				STBCTx80MHz:                        true,
+				STBCRx80MHz:                        true,
+				FullBandwidthULMUMIMO:              true,
+				PartialBandwidthULMUMIMO:           true,
+				DCMMaxConstellationTx:              2,
+				DCMMaxConstellationRx:              2,
+				SUBeamformee:                       true,
+				BeamformeeSTS80MHz:                 3,
+				BeamformeeSTSAbove80MHz:            3,
+				NG16SUFeedback:                     true,
+				NG16MUFeedback:                     true,
+				Codebook42SUFeedback:               true,
+				Codebook75MUFeedback:               true,
+				TriggeredCQIFeedback:               true,
+				PartialBandwidthExtendedRange:      true,
+				PPEThresholdsPresent:               true,
+				PowerBoostFactor:                   true,
+				HESUMUPPDU4xHELTFAnd08usGI:         true,
+				Support20MHzIn40MHzHEPPDUIn2GHz:    true,
+				Support20MHzIn160MHzHEPPDU:         true,
+				Support80MHzIn160MHzHEPPDU:         true,
+				DCMMaxRU:                           1,
+				LongerThan16HESIGBOFDMSymbols:      true,
+				NonTriggeredCQIFeedback:            true,
+				Tx1024QAMLess242ToneRU:             true,
+				Rx1024QAMLess242ToneRU:             true,
+				RxFullBWSUUsingMUCompressedSIGB:    true,
+				RxFullBWSUUsingMUNonCompressedSIGB: true,
+			}},
+		},
+		{
+			name:  "2.4GHz station",
+			attrs: mt7925IftypeAttrs(mt7925HECapPHY24GHz, []byte{0x22, 0x22, 0x22}, nil),
+			// In the 2.4GHz band a device which supports 40MHz channels
+			// reports a single EHT-MCS map.
+			he:  []HECapabilities{mt7925HECapabilities(mt7925HECapPHY24GHz, ChannelWidth80)},
+			eht: []EHTCapabilities{mt7925EHTCapabilities([]byte{0x22, 0x22, 0x22}, ChannelWidth80)},
+		},
+		{
+			name: "6GHz station",
+			attrs: mt7925IftypeAttrs(
+				mt7925HECapPHY6GHz,
+				[]byte{0x22, 0x22, 0x22, 0x22, 0x22, 0x22},
+				[]byte{0xba, 0x30},
+			),
+			// 160MHz support adds a second map to both the HE-MCS and
+			// the EHT-MCS sets.
+			he: []HECapabilities{func() HECapabilities {
+				he := mt7925HECapabilities(mt7925HECapPHY6GHz, ChannelWidth80, ChannelWidth160)
+				he.HE6GHzCapabilities = &HE6GHzCapabilities{
+					MinMPDUStartSpacing: 500 * time.Nanosecond,
+					MaxRxAMPDULength:    1048575,
+					MaxMPDULength:       11454,
+					RXAntennaPattern:    true,
+					TXAntennaPattern:    true,
+				}
+				return he
+			}()},
+			eht: []EHTCapabilities{mt7925EHTCapabilities(
+				[]byte{0x22, 0x22, 0x22, 0x22, 0x22, 0x22},
+				ChannelWidth80, ChannelWidth160,
+			)},
+		},
+		{
+			name: "6GHz AP, 320MHz capable",
+			attrs: ath12kIftypeAttrs(
+				InterfaceTypeAP,
+				ath12kHECapMACAP, ath12kHECapPHYAP,
+				ath12kEHTCapMAC, ath12kEHTCapPHYAP,
+			),
+			he: []HECapabilities{{
+				InterfaceTypes:                          []InterfaceType{InterfaceTypeAP},
+				HTCHE:                                   true,
+				TWTResponder:                            true,
+				DynamicFragmentation:                    1,
+				BSR:                                     true,
+				BroadcastTWT:                            true,
+				OMControl:                               true,
+				MaxAMPDULengthExponentExt:               3,
+				RxControlFrameToMultiBSS:                true,
+				AMSDUInAMPDU:                            true,
+				UL2x996ToneRU:                           true,
+				OMControlULMUDataDisableRx:              true,
+				Support40MHz80MHzIn5GHz:                 true,
+				Support160MHzIn5GHz:                     true,
+				PuncturedPreambleRx:                     3,
+				LDPCCodingInPayload:                     true,
+				HESUPPDU1xHELTFAnd08usGI:                true,
+				FullBandwidthULMUMIMO:                   true,
+				DCMMaxConstellationRx:                   1,
+				SUBeamformer:                            true,
+				SUBeamformee:                            true,
+				MUBeamformer:                            true,
+				BeamformeeSTS80MHz:                      7,
+				BeamformeeSTSAbove80MHz:                 7,
+				SoundingDimensions80MHz:                 1,
+				SoundingDimensionsAbove80MHz:            3,
+				NG16SUFeedback:                          true,
+				NG16MUFeedback:                          true,
+				Codebook42SUFeedback:                    true,
+				Codebook75MUFeedback:                    true,
+				TriggeredSUBeamformingFeedback:          true,
+				TriggeredMUBeamformingPartialBWFeedback: true,
+				TriggeredCQIFeedback:                    true,
+				PPEThresholdsPresent:                    true,
+				HESUMUPPDU4xHELTFAnd08usGI:              true,
+				MaxNc:                                   3,
+				HEERSUPPDU4xHELTFAnd08usGI:              true,
+				HEERSUPPDU1xHELTFAnd08usGI:              true,
+				NonTriggeredCQIFeedback:                 true,
+				Tx1024QAMLess242ToneRU:                  true,
+				Rx1024QAMLess242ToneRU:                  true,
+				SupportedMCSSets: []HEMCSNSSSet{
+					{Width: ChannelWidth80, RxHighestMCS: heMCS11NSS2, TxHighestMCS: heMCS11NSS2},
+					{Width: ChannelWidth160, RxHighestMCS: heMCS11NSS2, TxHighestMCS: heMCS11NSS2},
+				},
+				SupportedMCS:  ath12kHECapMCSSet,
+				PPEThresholds: ath12kHECapPPE,
+				HE6GHzCapabilities: &HE6GHzCapabilities{
+					MaxRxAMPDULength: 1048575,
+					MaxMPDULength:    11454,
+					SMPowerSave:      1,
+					RXAntennaPattern: true,
+					TXAntennaPattern: true,
+				},
+			}},
+			eht: []EHTCapabilities{{
+				InterfaceTypes:                          []InterfaceType{InterfaceTypeAP},
+				EPCSPriorityAccess:                      true,
+				OMControl:                               true,
+				TriggeredTXOPSharingMode1:               true,
+				RestrictedTWT:                           true,
+				SCSTrafficDescription:                   true,
+				MaxMPDULength:                           3895,
+				Support320MHzIn6GHz:                     true,
+				SUBeamformer:                            true,
+				SUBeamformee:                            true,
+				BeamformeeSS80MHz:                       7,
+				BeamformeeSS160MHz:                      7,
+				BeamformeeSS320MHz:                      7,
+				SoundingDimensions80MHz:                 3,
+				SoundingDimensions160MHz:                3,
+				SoundingDimensions320MHz:                3,
+				TriggeredSUBeamformingFeedback:          true,
+				TriggeredMUBeamformingPartialBWFeedback: true,
+				TriggeredCQIFeedback:                    true,
+				EHTMUPPDU4xEHTLTFAnd08usGI:              true,
+				MaxNc:                                   1,
+				NonTriggeredCQIFeedback:                 true,
+				RxLess242ToneRU:                         true,
+				CommonNominalPacketPadding:              20,
+				MaxSupportedEHTLTFs:                     1,
+				EHTDupIn6GHz:                            true,
+				NonOFDMAULMUMIMO80MHz:                   true,
+				NonOFDMAULMUMIMO160MHz:                  true,
+				NonOFDMAULMUMIMO320MHz:                  true,
+				MUBeamformer80MHz:                       true,
+				MUBeamformer160MHz:                      true,
+				MUBeamformer320MHz:                      true,
+				SupportedMCSSets: []EHTMCSNSSSet{
+					{Width: ChannelWidth80, MCSRanges: ehtMCS2NSS},
+					{Width: ChannelWidth160, MCSRanges: ehtMCS2NSS},
+					{Width: ChannelWidth320, MCSRanges: ehtMCS2NSS},
+				},
+				SupportedMCS: ath12kEHTCapMCSSet,
+			}},
+		},
+		{
+			// A device which supports no channel width beyond
+			// 20MHz reports the shorter EHT-MCS map, and its
+			// mandatory first HE-MCS map describes 20MHz.
+			name: "20MHz-only station",
+			attrs: narrowIftypeAttrs(
+				InterfaceTypeStation,
+				[]byte{0x22, 0x22, 0x22, 0x11},
+			),
+			he: []HECapabilities{{
+				InterfaceTypes: []InterfaceType{InterfaceTypeStation},
+				SupportedMCSSets: []HEMCSNSSSet{{
+					Width:        ChannelWidth20,
+					RxHighestMCS: heMCS11NSS2,
+					TxHighestMCS: heMCS11NSS2,
+				}},
+				SupportedMCS: mt7925HECapMCSSet,
+			}},
+			eht: []EHTCapabilities{{
+				InterfaceTypes: []InterfaceType{InterfaceTypeStation},
+				MaxMPDULength:  3895,
+				SupportedMCSSets: []EHTMCSNSSSet{{
+					Width: ChannelWidth20,
+					MCSRanges: []EHTMCSNSS{
+						{MinMCS: 0, MaxMCS: 7, RxMaxNSS: 2, TxMaxNSS: 2},
+						{MinMCS: 8, MaxMCS: 9, RxMaxNSS: 2, TxMaxNSS: 2},
+						{MinMCS: 10, MaxMCS: 11, RxMaxNSS: 2, TxMaxNSS: 2},
+						{MinMCS: 12, MaxMCS: 13, RxMaxNSS: 1, TxMaxNSS: 1},
+					},
+				}},
+				SupportedMCS: []byte{0x22, 0x22, 0x22, 0x11},
+			}},
+		},
+		{
+			// An access point reports the wider map even when it
+			// advertises no channel width beyond 20MHz.
+			name:  "20MHz-only AP",
+			attrs: narrowIftypeAttrs(InterfaceTypeAP, []byte{0x22, 0x22, 0x22}),
+			he: []HECapabilities{{
+				InterfaceTypes: []InterfaceType{InterfaceTypeAP},
+				SupportedMCSSets: []HEMCSNSSSet{{
+					Width:        ChannelWidth20,
+					RxHighestMCS: heMCS11NSS2,
+					TxHighestMCS: heMCS11NSS2,
+				}},
+				SupportedMCS: mt7925HECapMCSSet,
+			}},
+			eht: []EHTCapabilities{{
+				InterfaceTypes:   []InterfaceType{InterfaceTypeAP},
+				MaxMPDULength:    3895,
+				SupportedMCSSets: []EHTMCSNSSSet{{Width: ChannelWidth80, MCSRanges: ehtMCS2NSS}},
+				SupportedMCS:     []byte{0x22, 0x22, 0x22},
+			}},
+		},
+		{
+			name: "truncated HE PHY capabilities",
+			attrs: []netlink.Attribute{
+				{Type: unix.NL80211_BAND_IFTYPE_ATTR_HE_CAP_PHY, Data: mt7925HECapPHY24GHz[:10]},
+			},
+			wantErr: errInvalidHECapabilities,
+		},
+		{
+			name: "truncated HE 6GHz capabilities",
+			attrs: []netlink.Attribute{
+				{Type: unix.NL80211_BAND_IFTYPE_ATTR_HE_CAP_MAC, Data: mt7925HECapMAC},
+				{Type: unix.NL80211_BAND_IFTYPE_ATTR_HE_6GHZ_CAPA, Data: []byte{0xba}},
+			},
+			wantErr: errInvalidHECapabilities,
+		},
+		{
+			name: "truncated EHT MAC capabilities",
+			attrs: []netlink.Attribute{
+				{Type: unix.NL80211_BAND_IFTYPE_ATTR_EHT_CAP_MAC, Data: mt7925EHTCapMAC[:1]},
+			},
+			wantErr: errInvalidEHTCapabilities,
+		},
+		{
+			name: "truncated HE MAC capabilities",
+			attrs: []netlink.Attribute{
+				{Type: unix.NL80211_BAND_IFTYPE_ATTR_HE_CAP_MAC, Data: mt7925HECapMAC[:5]},
+			},
+			wantErr: errInvalidHECapabilities,
+		},
+		{
+			name: "truncated EHT PHY capabilities",
+			attrs: []netlink.Attribute{
+				{Type: unix.NL80211_BAND_IFTYPE_ATTR_EHT_CAP_PHY, Data: mt7925EHTCapPHY[:8]},
+			},
+			wantErr: errInvalidEHTCapabilities,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// The kernel nests the attributes of each interface type
+			// within an outer attribute indexed from one.
+			b := mustMarshalAttributes([]netlink.Attribute{{
+				Type: 1,
+				Data: mustMarshalAttributes(tt.attrs),
+			}})
+
+			he, eht, err := parseBandIftypeData(b)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("unexpected error: got %v, want %v", err, tt.wantErr)
+			}
+			if tt.wantErr != nil {
+				return
+			}
+
+			if diff := cmp.Diff(tt.he, he); diff != "" {
+				t.Errorf("unexpected HE capabilities (-want +got):\n%s", diff)
+			}
+
+			if diff := cmp.Diff(tt.eht, eht); diff != "" {
+				t.Errorf("unexpected EHT capabilities (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// mt7925IftypeAttrs builds the attributes the kernel reports for the station
+// interface type of one band of an MT7925 device.
+func mt7925IftypeAttrs(hePHYCap, ehtMCSSet, he6GHzCapa []byte) []netlink.Attribute {
+	attrs := []netlink.Attribute{
+		{
+			Type: unix.NL80211_BAND_IFTYPE_ATTR_IFTYPES,
+			Data: mustMarshalAttributes([]netlink.Attribute{
+				{Type: uint16(InterfaceTypeStation)},
+			}),
+		},
+		{Type: unix.NL80211_BAND_IFTYPE_ATTR_HE_CAP_MAC, Data: mt7925HECapMAC},
+		{Type: unix.NL80211_BAND_IFTYPE_ATTR_HE_CAP_PHY, Data: hePHYCap},
+		{Type: unix.NL80211_BAND_IFTYPE_ATTR_HE_CAP_MCS_SET, Data: mt7925HECapMCSSet},
+		{Type: unix.NL80211_BAND_IFTYPE_ATTR_HE_CAP_PPE, Data: mt7925HECapPPE},
+		{Type: unix.NL80211_BAND_IFTYPE_ATTR_EHT_CAP_MAC, Data: mt7925EHTCapMAC},
+		{Type: unix.NL80211_BAND_IFTYPE_ATTR_EHT_CAP_PHY, Data: mt7925EHTCapPHY},
+		{Type: unix.NL80211_BAND_IFTYPE_ATTR_EHT_CAP_MCS_SET, Data: ehtMCSSet},
+	}
+
+	if he6GHzCapa != nil {
+		attrs = append(attrs, netlink.Attribute{
+			Type: unix.NL80211_BAND_IFTYPE_ATTR_HE_6GHZ_CAPA,
+			Data: he6GHzCapa,
+		})
+	}
+
+	return attrs
+}
+
+// mt7925HECapabilities returns the HE capabilities an MT7925 device advertises
+// for the station interface type, with one HE-MCS set per channel width in
+// widths.
+func mt7925HECapabilities(hePHYCap []byte, widths ...ChannelWidth) HECapabilities {
+	// The device supports MCS 0-11 with one and two spatial streams, at
+	// every channel width it supports.
+	sets := make([]HEMCSNSSSet, 0, len(widths))
+	for _, w := range widths {
+		sets = append(sets, HEMCSNSSSet{
+			Width:        w,
+			RxHighestMCS: heMCS11NSS2,
+			TxHighestMCS: heMCS11NSS2,
+		})
+	}
+
+	return HECapabilities{
+		InterfaceTypes:                     []InterfaceType{InterfaceTypeStation},
+		HTCHE:                              true,
+		TriggerFrameMACPaddingDuration:     16,
+		OMControl:                          true,
+		MaxAMPDULengthExponentExt:          3,
+		AMSDUInAMPDU:                       true,
+		Support40MHzIn2GHz:                 hePHYCap[0]&(1<<1) != 0,
+		Support40MHz80MHzIn5GHz:            hePHYCap[0]&(1<<2) != 0,
+		Support160MHzIn5GHz:                hePHYCap[0]&(1<<3) != 0,
+		Support242ToneRUIn2GHz:             hePHYCap[0]&(1<<5) != 0,
+		Support242ToneRUIn5GHz:             hePHYCap[0]&(1<<6) != 0,
+		DeviceClassA:                       true,
+		LDPCCodingInPayload:                true,
+		HESUPPDU1xHELTFAnd08usGI:           true,
+		NDP4xHELTFAnd32usGI:                true,
+		STBCTx80MHz:                        true,
+		STBCRx80MHz:                        true,
+		FullBandwidthULMUMIMO:              true,
+		PartialBandwidthULMUMIMO:           true,
+		DCMMaxConstellationTx:              2,
+		DCMMaxConstellationRx:              2,
+		SUBeamformee:                       true,
+		BeamformeeSTS80MHz:                 3,
+		BeamformeeSTSAbove80MHz:            3,
+		NG16SUFeedback:                     true,
+		NG16MUFeedback:                     true,
+		Codebook42SUFeedback:               true,
+		Codebook75MUFeedback:               true,
+		TriggeredCQIFeedback:               true,
+		PartialBandwidthExtendedRange:      true,
+		PPEThresholdsPresent:               true,
+		PowerBoostFactor:                   true,
+		HESUMUPPDU4xHELTFAnd08usGI:         true,
+		Support20MHzIn40MHzHEPPDUIn2GHz:    true,
+		Support20MHzIn160MHzHEPPDU:         true,
+		Support80MHzIn160MHzHEPPDU:         true,
+		DCMMaxRU:                           1,
+		LongerThan16HESIGBOFDMSymbols:      true,
+		NonTriggeredCQIFeedback:            true,
+		Tx1024QAMLess242ToneRU:             true,
+		Rx1024QAMLess242ToneRU:             true,
+		RxFullBWSUUsingMUCompressedSIGB:    true,
+		RxFullBWSUUsingMUNonCompressedSIGB: true,
+		SupportedMCSSets:                   sets,
+		SupportedMCS:                       mt7925HECapMCSSet,
+		PPEThresholds:                      mt7925HECapPPE,
+	}
+}
+
+// mt7925EHTCapabilities returns the EHT capabilities an MT7925 device
+// advertises for the station interface type, with one EHT-MCS set per channel
+// width in widths.
+func mt7925EHTCapabilities(ehtMCSSet []byte, widths ...ChannelWidth) EHTCapabilities {
+	// The device supports two spatial streams for every MCS range, at every
+	// channel width it supports.
+	sets := make([]EHTMCSNSSSet, 0, len(widths))
+	for _, w := range widths {
+		sets = append(sets, EHTMCSNSSSet{
+			Width:     w,
+			MCSRanges: ehtMCS2NSS,
+		})
+	}
+
+	return EHTCapabilities{
+		InterfaceTypes:                          []InterfaceType{InterfaceTypeStation},
+		EPCSPriorityAccess:                      true,
+		OMControl:                               true,
+		MaxMPDULength:                           3895,
+		NDP4xEHTLTFAnd32usGI:                    true,
+		SUBeamformer:                            true,
+		SUBeamformee:                            true,
+		BeamformeeSS80MHz:                       1,
+		BeamformeeSS160MHz:                      1,
+		SoundingDimensions80MHz:                 1,
+		SoundingDimensions160MHz:                1,
+		NG16SUFeedback:                          true,
+		NG16MUFeedback:                          true,
+		Codebook42SUFeedback:                    true,
+		Codebook75MUFeedback:                    true,
+		TriggeredSUBeamformingFeedback:          true,
+		TriggeredMUBeamformingPartialBWFeedback: true,
+		TriggeredCQIFeedback:                    true,
+		MaxNc:                                   1,
+		NonTriggeredCQIFeedback:                 true,
+		CommonNominalPacketPadding:              16,
+		MaxSupportedEHTLTFs:                     17,
+		MCS15Support:                            1,
+		NonOFDMAULMUMIMO80MHz:                   true,
+		NonOFDMAULMUMIMO160MHz:                  true,
+		MUBeamformer80MHz:                       true,
+		MUBeamformer160MHz:                      true,
+		SupportedMCSSets:                        sets,
+		SupportedMCS:                            ehtMCSSet,
+	}
+}
+
+// Capability data captured from an 8devices Kiwi-DVK (ath12k, 802.11be), for
+// the three interface types of its 6GHz band.  Unlike the MT7925 above, this device
+// supports 320MHz channels, so its Supported EHT-MCS And NSS Set holds three
+// maps rather than one.
+var (
+	ath12kHECapMACStation = []byte{0x0b, 0x00, 0x18, 0x9a, 0x40, 0x18}
+	ath12kHECapMACAP      = []byte{0x0d, 0x00, 0x18, 0x9a, 0x40, 0x18}
+	ath12kHECapMACMesh    = []byte{0x09, 0x00, 0x08, 0x8a, 0x40, 0x10}
+
+	ath12kHECapPHYStation = []byte{
+		0x0c, 0x63, 0x40, 0x89, 0xff, 0xd9,
+		0x9f, 0x1c, 0x11, 0x0e, 0x00,
+	}
+	ath12kHECapPHYAP = []byte{
+		0x0c, 0x63, 0x40, 0x88, 0xff, 0xd9,
+		0x9f, 0x1c, 0x11, 0x0e, 0x00,
+	}
+	ath12kHECapPHYMesh = []byte{
+		0x0c, 0x63, 0x00, 0x80, 0xfd, 0x59,
+		0x85, 0x1c, 0x10, 0x00, 0x00,
+	}
+
+	ath12kHECapMCSSet = []byte{
+		0xfa, 0xff, 0xfa, 0xff,
+		0xfa, 0xff, 0xfa, 0xff,
+		0x00, 0x00, 0x00, 0x00,
+	}
+	ath12kHECapPPE = []byte{
+		0x79, 0x1c, 0xc7, 0x71, 0x1c, 0xc7, 0x71, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	}
+
+	ath12kEHTCapMAC     = []byte{0x37, 0x00}
+	ath12kEHTCapMACMesh = []byte{0x36, 0x00}
+
+	ath12kEHTCapPHYStation = []byte{
+		0xe2, 0xff, 0xdb, 0xe0, 0x18,
+		0x77, 0x80, 0x00, 0x00,
+	}
+	ath12kEHTCapPHYAP = []byte{
+		0xe2, 0xff, 0xdb, 0xe0, 0x18,
+		0x75, 0x80, 0x7e, 0x00,
+	}
+	ath12kEHTCapPHYMesh = []byte{
+		0xe2, 0xff, 0xdb, 0x20, 0x10,
+		0x30, 0x80, 0x00, 0x00,
+	}
+
+	// Three maps: 80MHz and below, 160MHz and 320MHz.
+	ath12kEHTCapMCSSet = []byte{
+		0x22, 0x22, 0x22,
+		0x22, 0x22, 0x22,
+		0x22, 0x22, 0x22,
+	}
+
+	ath12kHE6GHzCapa = []byte{0xb8, 0x32}
+)
+
+// ath12kIftypeAttrs builds the attributes the kernel reports for one interface
+// type of the 6GHz band of an ath12k device.
+func ath12kIftypeAttrs(iftype InterfaceType, heMAC, hePHY, ehtMAC, ehtPHY []byte) []netlink.Attribute {
+	return []netlink.Attribute{
+		{
+			Type: unix.NL80211_BAND_IFTYPE_ATTR_IFTYPES,
+			Data: mustMarshalAttributes([]netlink.Attribute{{Type: uint16(iftype)}}),
+		},
+		{Type: unix.NL80211_BAND_IFTYPE_ATTR_HE_CAP_MAC, Data: heMAC},
+		{Type: unix.NL80211_BAND_IFTYPE_ATTR_HE_CAP_PHY, Data: hePHY},
+		{Type: unix.NL80211_BAND_IFTYPE_ATTR_HE_CAP_MCS_SET, Data: ath12kHECapMCSSet},
+		{Type: unix.NL80211_BAND_IFTYPE_ATTR_HE_CAP_PPE, Data: ath12kHECapPPE},
+		{Type: unix.NL80211_BAND_IFTYPE_ATTR_EHT_CAP_MAC, Data: ehtMAC},
+		{Type: unix.NL80211_BAND_IFTYPE_ATTR_EHT_CAP_PHY, Data: ehtPHY},
+		{Type: unix.NL80211_BAND_IFTYPE_ATTR_EHT_CAP_MCS_SET, Data: ath12kEHTCapMCSSet},
+		{Type: unix.NL80211_BAND_IFTYPE_ATTR_HE_6GHZ_CAPA, Data: ath12kHE6GHzCapa},
+	}
+}
+
+// TestLinux_parseBandIftypeDataMultipleIftypes verifies that every interface
+// type of a band is decoded, in the order the kernel reports them.  A band of
+// an ath12k device reports three: station, AP and mesh point.
+func TestLinux_parseBandIftypeDataMultipleIftypes(t *testing.T) {
+	entries := [][]netlink.Attribute{
+		ath12kIftypeAttrs(InterfaceTypeStation, ath12kHECapMACStation, ath12kHECapPHYStation, ath12kEHTCapMAC, ath12kEHTCapPHYStation),
+		ath12kIftypeAttrs(InterfaceTypeAP, ath12kHECapMACAP, ath12kHECapPHYAP, ath12kEHTCapMAC, ath12kEHTCapPHYAP),
+		ath12kIftypeAttrs(InterfaceTypeMeshPoint, ath12kHECapMACMesh, ath12kHECapPHYMesh, ath12kEHTCapMACMesh, ath12kEHTCapPHYMesh),
+	}
+
+	// The kernel indexes the interface types of a band from one.
+	var attrs []netlink.Attribute
+	for i, e := range entries {
+		attrs = append(attrs, netlink.Attribute{
+			Type: uint16(i + 1),
+			Data: mustMarshalAttributes(e),
+		})
+	}
+
+	he, eht, err := parseBandIftypeData(mustMarshalAttributes(attrs))
+	if err != nil {
+		t.Fatalf("failed to parse band interface type data: %v", err)
+	}
+
+	want := [][]InterfaceType{
+		{InterfaceTypeStation},
+		{InterfaceTypeAP},
+		{InterfaceTypeMeshPoint},
+	}
+
+	var gotHE, gotEHT [][]InterfaceType
+	for i := range he {
+		gotHE = append(gotHE, he[i].InterfaceTypes)
+	}
+	for i := range eht {
+		gotEHT = append(gotEHT, eht[i].InterfaceTypes)
+	}
+
+	if diff := cmp.Diff(want, gotHE); diff != "" {
+		t.Errorf("unexpected HE interface types (-want +got):\n%s", diff)
+	}
+
+	if diff := cmp.Diff(want, gotEHT); diff != "" {
+		t.Errorf("unexpected EHT interface types (-want +got):\n%s", diff)
+	}
+
+	// Each interface type carries its own capabilities: only the AP
+	// advertises itself as an MU beamformer, and only the mesh point lacks
+	// EPCS priority access.
+	if eht[0].MUBeamformer320MHz || !eht[1].MUBeamformer320MHz {
+		t.Error("expected only the AP to advertise MU beamforming at 320MHz")
+	}
+
+	if !eht[0].EPCSPriorityAccess || eht[2].EPCSPriorityAccess {
+		t.Error("expected only the mesh point to lack EPCS priority access")
+	}
+}
+
+// narrowIftypeAttrs builds the attributes of an interface type which advertises
+// no channel width beyond 20MHz, and no PPE thresholds.  No device to hand
+// reports this, so the capability fields are synthetic; only the lengths and
+// the bits which select the MCS maps matter.
+func narrowIftypeAttrs(iftype InterfaceType, ehtMCSSet []byte) []netlink.Attribute {
+	return []netlink.Attribute{
+		{
+			Type: unix.NL80211_BAND_IFTYPE_ATTR_IFTYPES,
+			Data: mustMarshalAttributes([]netlink.Attribute{{Type: uint16(iftype)}}),
+		},
+		{Type: unix.NL80211_BAND_IFTYPE_ATTR_HE_CAP_MAC, Data: make([]byte, heMACCapLen)},
+		{Type: unix.NL80211_BAND_IFTYPE_ATTR_HE_CAP_PHY, Data: make([]byte, hePHYCapLen)},
+		{Type: unix.NL80211_BAND_IFTYPE_ATTR_HE_CAP_MCS_SET, Data: mt7925HECapMCSSet},
+		{Type: unix.NL80211_BAND_IFTYPE_ATTR_HE_CAP_PPE, Data: make([]byte, 25)},
+		{Type: unix.NL80211_BAND_IFTYPE_ATTR_EHT_CAP_MAC, Data: make([]byte, ehtMACCapLen)},
+		{Type: unix.NL80211_BAND_IFTYPE_ATTR_EHT_CAP_PHY, Data: make([]byte, ehtPHYCapLen)},
+		{Type: unix.NL80211_BAND_IFTYPE_ATTR_EHT_CAP_MCS_SET, Data: ehtMCSSet},
+	}
+}
+
+// TestLinux_parseBandAttributesIftypeData verifies that the capabilities of a
+// band's interface types are attached to that band, and that the repeated
+// messages the kernel sends for a band do not accumulate duplicates.
+func TestLinux_parseBandAttributesIftypeData(t *testing.T) {
+	// A band other than the first, to check the indexing.
+	const band = 2
+
+	nlband := netlink.Attribute{
+		Type: band,
+		Data: mustMarshalAttributes([]netlink.Attribute{{
+			Type: unix.NL80211_BAND_ATTR_IFTYPE_DATA,
+			Data: mustMarshalAttributes([]netlink.Attribute{{
+				Type: 1,
+				Data: mustMarshalAttributes(ath12kIftypeAttrs(
+					InterfaceTypeAP,
+					ath12kHECapMACAP, ath12kHECapPHYAP,
+					ath12kEHTCapMAC, ath12kEHTCapPHYAP,
+				)),
+			}}),
+		}}),
+	}
+
+	p := new(PHY)
+	if err := p.parseBandAttributes(nlband); err != nil {
+		t.Fatalf("failed to parse band attributes: %v", err)
+	}
+
+	// Bands are indexed by band number, so the earlier bands exist but are
+	// empty.
+	if diff := cmp.Diff(band+1, len(p.BandAttributes)); diff != "" {
+		t.Fatalf("unexpected number of bands (-want +got):\n%s", diff)
+	}
+
+	ba := p.BandAttributes[band]
+
+	if diff := cmp.Diff(1, len(ba.HECapabilities)); diff != "" {
+		t.Fatalf("unexpected number of HE capability sets (-want +got):\n%s", diff)
+	}
+
+	if diff := cmp.Diff(1, len(ba.EHTCapabilities)); diff != "" {
+		t.Fatalf("unexpected number of EHT capability sets (-want +got):\n%s", diff)
+	}
+
+	if diff := cmp.Diff([]InterfaceType{InterfaceTypeAP}, ba.EHTCapabilities[0].InterfaceTypes); diff != "" {
+		t.Errorf("unexpected interface types (-want +got):\n%s", diff)
+	}
+
+	// 320MHz support adds a third EHT-MCS map.
+	if diff := cmp.Diff(3, len(ba.EHTCapabilities[0].SupportedMCSSets)); diff != "" {
+		t.Errorf("unexpected number of EHT-MCS sets (-want +got):\n%s", diff)
+	}
+
+	// The kernel sends several messages for one band, and only the first
+	// carries the capabilities; a repeat must not duplicate them.
+	if err := p.parseBandAttributes(nlband); err != nil {
+		t.Fatalf("failed to parse band attributes again: %v", err)
+	}
+
+	if diff := cmp.Diff(1, len(ba.EHTCapabilities)); diff != "" {
+		t.Errorf("unexpected number of EHT capability sets after a repeated message (-want +got):\n%s", diff)
+	}
+}
+
+// TestLinux_decodeCapabilityEncodings exercises the subfields which are decoded
+// from an encoding into a real unit, since a transposed table entry there is
+// invisible in the capability bits themselves.
+func TestLinux_decodeCapabilityEncodings(t *testing.T) {
+	t.Run("EHT maximum MPDU length", func(t *testing.T) {
+		// The length lives in the top two bits of the first byte.
+		for encoding, want := range map[byte]int{0: 3895, 1: 7991, 2: 11454, 3: 0} {
+			var ehtcap EHTCapabilities
+			decodeEHTMACCapabilities(&ehtcap, []byte{encoding << 6, 0x00})
+
+			if diff := cmp.Diff(want, ehtcap.MaxMPDULength); diff != "" {
+				t.Errorf("unexpected length for encoding %d (-want +got):\n%s", encoding, diff)
+			}
+		}
+	})
+
+	t.Run("EHT common nominal packet padding", func(t *testing.T) {
+		for encoding, want := range map[byte]int{0: 0, 1: 8, 2: 16, 3: 20} {
+			var ehtcap EHTCapabilities
+			phy := make([]byte, ehtPHYCapLen)
+			phy[5] = encoding << 4
+
+			decodeEHTPHYCapabilities(&ehtcap, phy)
+
+			if diff := cmp.Diff(want, ehtcap.CommonNominalPacketPadding); diff != "" {
+				t.Errorf("unexpected padding for encoding %d (-want +got):\n%s", encoding, diff)
+			}
+		}
+	})
+
+	t.Run("HE minimum fragment size and padding duration", func(t *testing.T) {
+		for encoding, want := range map[byte]int{0: 0, 1: 128, 2: 256, 3: 512} {
+			var hecap HECapabilities
+			mac := make([]byte, heMACCapLen)
+			mac[1] = encoding
+
+			decodeHEMACCapabilities(&hecap, mac)
+
+			if diff := cmp.Diff(want, hecap.MinFragmentSize); diff != "" {
+				t.Errorf("unexpected fragment size for encoding %d (-want +got):\n%s", encoding, diff)
+			}
+		}
+
+		// The reserved encoding is reported as no padding.
+		for encoding, want := range map[byte]int{0: 0, 1: 8, 2: 16, 3: 0} {
+			var hecap HECapabilities
+			mac := make([]byte, heMACCapLen)
+			mac[1] = encoding << 2
+
+			decodeHEMACCapabilities(&hecap, mac)
+
+			if diff := cmp.Diff(want, hecap.TriggerFrameMACPaddingDuration); diff != "" {
+				t.Errorf("unexpected duration for encoding %d (-want +got):\n%s", encoding, diff)
+			}
+		}
+	})
+
+	t.Run("HE nominal packet padding", func(t *testing.T) {
+		for encoding, want := range map[byte]int{0: 0, 1: 8, 2: 16, 3: 0} {
+			var hecap HECapabilities
+			phy := make([]byte, hePHYCapLen)
+			phy[9] = encoding << 6
+
+			decodeHEPHYCapabilities(&hecap, phy)
+
+			if diff := cmp.Diff(want, hecap.NominalPacketPadding); diff != "" {
+				t.Errorf("unexpected padding for encoding %d (-want +got):\n%s", encoding, diff)
+			}
+		}
+	})
+
+	t.Run("HE 6GHz maximum lengths", func(t *testing.T) {
+		// Maximum MPDU length, in the same encoding as VHT uses.
+		for encoding, want := range map[uint16]int{0: 3895, 1: 7991, 2: 11454, 3: 0} {
+			got := decodeHE6GHzCapabilities(encoding << 6)
+
+			if diff := cmp.Diff(want, got.MaxMPDULength); diff != "" {
+				t.Errorf("unexpected length for encoding %d (-want +got):\n%s", encoding, diff)
+			}
+		}
+
+		// The A-MPDU length exponent extends the 8KiB minimum.
+		for encoding, want := range map[uint16]int{0: 8191, 3: 65535, 7: 1048575} {
+			got := decodeHE6GHzCapabilities(encoding << 3)
+
+			if diff := cmp.Diff(want, got.MaxRxAMPDULength); diff != "" {
+				t.Errorf("unexpected A-MPDU length for exponent %d (-want +got):\n%s", encoding, diff)
+			}
+		}
+
+		// The minimum MPDU start spacing doubles from 1/4 microsecond.
+		for encoding, want := range map[uint16]time.Duration{0: 0, 1: 250, 2: 500, 7: 16000} {
+			got := decodeHE6GHzCapabilities(encoding)
+
+			if diff := cmp.Diff(want*time.Nanosecond, got.MinMPDUStartSpacing); diff != "" {
+				t.Errorf("unexpected spacing for encoding %d (-want +got):\n%s", encoding, diff)
+			}
+		}
+	})
+}
+
+// The Supported MCS Set fields reported by both an MT7925 and an 8devices
+// Kiwi-DVK: MCS 0-15 for HT, and MCS 0-9 with one and two spatial streams for
+// VHT.  Neither device specifies a highest data rate.
+var (
+	twoStreamHTMCSSet = [16]byte{
+		0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+	}
+
+	twoStreamVHTMCSSet = [8]byte{0xfa, 0xff, 0x00, 0x00, 0xfa, 0xff, 0x00, 0x20}
+)
+
+func TestLinux_decodeHTMCSSet(t *testing.T) {
+	// The receive bitmask holds one bit per MCS index, so a device
+	// supporting every index up to hi sets the first hi+1 bits.
+	upTo := func(hi int) []int {
+		var mcs []int
+		for i := range hi + 1 {
+			mcs = append(mcs, i)
+		}
+		return mcs
+	}
+
+	tests := []struct {
+		name string
+		mcs  [16]byte
+		want HTCapabilities
+	}{
+		{
+			name: "two streams",
+			mcs:  twoStreamHTMCSSet,
+			want: HTCapabilities{
+				RxMCS: upTo(15),
+				// The transmit set is defined and matches the
+				// receive set, so the stream count and unequal
+				// modulation fields carry no meaning.
+				TxMCSSetDefined:     true,
+				TxMaxSpatialStreams: 1,
+			},
+		},
+		{
+			name: "four streams with unequal modulation",
+			mcs: [16]byte{
+				// MCS 0-31, plus index 32, the 40MHz duplicate.
+				0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00,
+				0x00, 0x00,
+				// A highest receive rate of 300Mb/s.
+				0x2c, 0x01,
+				// Defined, differing, four streams, unequal.
+				0x1f, 0x00, 0x00, 0x00,
+			},
+			want: HTCapabilities{
+				RxMCS:               upTo(32),
+				RxHighestRate:       300,
+				TxMCSSetDefined:     true,
+				TxRxMCSSetNotEqual:  true,
+				TxMaxSpatialStreams: 4,
+				TxUnequalModulation: true,
+			},
+		},
+		{
+			name: "no transmit set defined",
+			mcs: [16]byte{
+				0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			},
+			want: HTCapabilities{
+				RxMCS:               upTo(7),
+				TxMaxSpatialStreams: 1,
+			},
+		},
+		{
+			// The highest index the bitmask can express; the three
+			// bits above it are reserved and must be ignored.
+			name: "highest index only",
+			mcs: [16]byte{
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+				0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			},
+			want: HTCapabilities{
+				RxMCS:               []int{72, 73, 74, 75, 76},
+				TxMaxSpatialStreams: 1,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			htcap := HTCapabilities{SupportedMCS: tt.mcs}
+			decodeHTMCSSet(&htcap)
+
+			want := tt.want
+			want.SupportedMCS = tt.mcs
+
+			if diff := cmp.Diff(want, htcap); diff != "" {
+				t.Errorf("unexpected HT MCS set (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestLinux_decodeVHTMCSSet(t *testing.T) {
+	tests := []struct {
+		name string
+		mcs  [8]byte
+		want VHTCapabilities
+	}{
+		{
+			name: "two streams",
+			mcs:  twoStreamVHTMCSSet,
+			want: VHTCapabilities{
+				RxHighestMCS:         [8]int{9, 9, -1, -1, -1, -1, -1, -1},
+				TxHighestMCS:         [8]int{9, 9, -1, -1, -1, -1, -1, -1},
+				ExtendedNSSBWCapable: true,
+			},
+		},
+		{
+			// Every per-stream encoding in one map: MCS 0-7, 0-8,
+			// 0-9, then unsupported.
+			name: "every stream encoding",
+			mcs: [8]byte{
+				0xe4, 0xff,
+				// 866Mb/s, and four space-time streams.
+				0x62, 0x83,
+				0xe4, 0xff,
+				// 866Mb/s, and capable of extended NSS BW.
+				0x62, 0x23,
+			},
+			want: VHTCapabilities{
+				RxHighestMCS:         [8]int{7, 8, 9, -1, -1, -1, -1, -1},
+				TxHighestMCS:         [8]int{7, 8, 9, -1, -1, -1, -1, -1},
+				RxHighestRate:        866,
+				TxHighestRate:        866,
+				MaxNSTSTotal:         4,
+				ExtendedNSSBWCapable: true,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vhtcap := VHTCapabilities{SupportedMCS: tt.mcs}
+			decodeVHTMCSSet(&vhtcap)
+
+			want := tt.want
+			want.SupportedMCS = tt.mcs
+
+			if diff := cmp.Diff(want, vhtcap); diff != "" {
+				t.Errorf("unexpected VHT MCS set (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestLinux_parseBandAttributesMCSSets verifies that the HT and VHT MCS sets of
+// a band are decoded as the band attributes are parsed.
+func TestLinux_parseBandAttributesMCSSets(t *testing.T) {
+	p := new(PHY)
+	err := p.parseBandAttributes(netlink.Attribute{
+		Type: 0,
+		Data: mustMarshalAttributes([]netlink.Attribute{
+			{Type: unix.NL80211_BAND_ATTR_HT_MCS_SET, Data: twoStreamHTMCSSet[:]},
+			{Type: unix.NL80211_BAND_ATTR_VHT_MCS_SET, Data: twoStreamVHTMCSSet[:]},
+		}),
+	})
+	if err != nil {
+		t.Fatalf("failed to parse band attributes: %v", err)
+	}
+
+	ba := p.BandAttributes[0]
+
+	if diff := cmp.Diff(16, len(ba.HTCapabilities.RxMCS)); diff != "" {
+		t.Errorf("unexpected number of HT MCS indices (-want +got):\n%s", diff)
+	}
+
+	want := [8]int{9, 9, -1, -1, -1, -1, -1, -1}
+	if diff := cmp.Diff(want, ba.VHTCapabilities.RxHighestMCS); diff != "" {
+		t.Errorf("unexpected VHT receive MCS (-want +got):\n%s", diff)
 	}
 }

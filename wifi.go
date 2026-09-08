@@ -648,6 +648,22 @@ type BandAttributes struct {
 	// Very High Throughput (802.11ac) device capabilities (nil if not supported).
 	VHTCapabilities *VHTCapabilities
 
+	// High Efficiency (802.11ax) device capabilities for this band (nil if
+	// not supported).  Unlike HT and VHT capabilities, which apply to a
+	// band as a whole, these also depend on the role an interface operates
+	// in, so there is one element for each set of interface types which
+	// share the same capabilities.  Find the relevant element by searching
+	// its InterfaceTypes field: the order of the elements is chosen by the
+	// driver and means nothing.
+	HECapabilities []HECapabilities
+
+	// Extremely High Throughput (802.11be) device capabilities for this
+	// band (nil if not supported).  As with HECapabilities, there is one
+	// element for each set of interface types which share the same
+	// capabilities, to be found by searching its InterfaceTypes field
+	// rather than by position.
+	EHTCapabilities []EHTCapabilities
+
 	// Minimum spacing between A-MPDU frames.  Used for both HT and VHT
 	// capable devices.
 	MinRxAMPDUSpacing time.Duration
@@ -715,9 +731,36 @@ type HTCapabilities struct {
 	// size.
 	MaxRxAMPDULength int
 
-	// Supported MCS for HT mode
-	// Todo:
-	// - Parse them are according to Section 7.3.2.56.4 IEEE 80211n
+	// The MCS indices the device supports receiving, in ascending order.
+	// Indices 0 through 7 use a single spatial stream, 8 through 31 use
+	// several with equal modulation, and the remainder use several with
+	// unequal modulation.
+	RxMCS []int
+
+	// The highest data rate the device supports receiving, in Mb/s.  Zero
+	// means the device does not specify one.
+	RxHighestRate int
+
+	// Device defines a set of MCS indices for transmission.  The three
+	// fields below are only meaningful when this is set.
+	TxMCSSetDefined bool
+
+	// The device's transmit MCS set differs from RxMCS, which it does not
+	// report.  When this is not set, the device transmits the same indices
+	// it receives.
+	TxRxMCSSetNotEqual bool
+
+	// The maximum number of spatial streams the device supports for
+	// transmission.  Valid values are 1 through 4.  Only meaningful when
+	// TxRxMCSSetNotEqual is set.
+	TxMaxSpatialStreams int
+
+	// Device supports transmitting with unequal modulation.  Only
+	// meaningful when TxRxMCSSetNotEqual is set.
+	TxUnequalModulation bool
+
+	// The raw Supported MCS Set field, from which the fields above are
+	// decoded (802.11-2020, 9.4.2.55.4).
 	SupportedMCS [16]byte
 }
 
@@ -792,10 +835,685 @@ type VHTCapabilities struct {
 	//Support subfield of the VHT Capabilities Information field.
 	ExtendedNSSBW int
 
-	// Supported MCS for VHT mode
-	// Todo:
-	// - Parse them according to Section 8.4.2.160.3 IEEE Std 80211ac-2013
+	// The highest MCS index the device supports for reception and for
+	// transmission with each number of spatial streams, indexed by the
+	// number of spatial streams minus one.  Valid values are 7, 8 and 9, or
+	// -1 when the device does not support that number of streams.
+	RxHighestMCS [8]int
+	TxHighestMCS [8]int
+
+	// The highest data rate the device supports for reception and for
+	// transmission using a long guard interval, in Mb/s.  Zero means the
+	// device does not specify one.
+	RxHighestRate int
+	TxHighestRate int
+
+	// The maximum total number of space-time streams the device supports
+	// receiving.
+	MaxNSTSTotal int
+
+	// Device is capable of interpreting the Extended NSS BW Support
+	// subfield of another device's VHT Capabilities element.  This is
+	// distinct from ExtendedNSSBW above, which is the value of this
+	// device's own subfield.
+	ExtendedNSSBWCapable bool
+
+	// The raw VHT Supported MCS Set field, from which the fields above are
+	// decoded (802.11-2020, 9.4.2.157.3).
 	SupportedMCS [8]byte
+}
+
+// HECapabilities represents 802.11ax (High Efficiency, WiFi 6) capabilities.
+// These are specific to a band, as HT and VHT capabilities are, but 802.11ax
+// also allows them to vary with the role an interface operates in, so a band
+// may report several sets of them.  Failure to support any given attribute may
+// be due to lack of support in the driver or the firmware, not only in the
+// hardware.
+//
+// The fields represent those in the HE Capabilities element (802.11ax,
+// 9.4.2.248).
+type HECapabilities struct {
+	// The interface types these capabilities apply to, which identify this
+	// set within its band.  An interface type belongs to at most one set:
+	// the kernel refuses to register a device which reports otherwise.
+	//
+	// Interfaces of type InterfaceTypeAPVLAN are never listed, and use the
+	// capabilities reported for InterfaceTypeAP.
+	InterfaceTypes []InterfaceType
+
+	// Fields of the HE MAC Capabilities Information field (9.4.2.248.2).
+
+	// Device supports the HT Control field in HE frames.
+	HTCHE bool
+
+	// Device supports requesting TWT (Target Wake Time) agreements.
+	TWTRequester bool
+
+	// Device supports responding to TWT (Target Wake Time) requests.
+	TWTResponder bool
+
+	// The level of dynamic fragmentation the device supports.  Valid values
+	// are 0 (not supported) through 3.
+	DynamicFragmentation int
+
+	// The maximum number of fragmented MSDUs the device supports, encoded
+	// as in 802.11ax: values 0 through 6 indicate 1, 2, 4, 8, 16, 32 and 64
+	// fragments, and 7 indicates no limit.
+	MaxFragmentedMSDUs int
+
+	// The minimum payload size of a fragment the device supports, in bytes.
+	// Zero means the device imposes no restriction.
+	MinFragmentSize int
+
+	// The MAC padding duration the device requires for a trigger frame, in
+	// microseconds.  Valid values are 0, 8 and 16; the reserved encoding is
+	// reported as 0.
+	TriggerFrameMACPaddingDuration int
+
+	// The number of TIDs (Traffic Identifiers) the device supports
+	// aggregating in a received A-MPDU, minus one.
+	MultiTIDAggregationRx int
+
+	// The type of HE link adaptation supported by the device.  Valid values
+	// are 0 (no feedback), 2 (unsolicited feedback) and 3 (both solicited
+	// and unsolicited feedback).  Only meaningful when HTCHE is set.
+	LinkAdaptation int
+
+	// Device supports the All Ack variant of the Multi-STA BlockAck frame.
+	AllAck bool
+
+	// Device supports TRS (Triggered Response Scheduling).
+	TRS bool
+
+	// Device supports BSR (Buffer Status Report) control.
+	BSR bool
+
+	// Device supports broadcast TWT (Target Wake Time).
+	BroadcastTWT bool
+
+	// Device supports 32-bit BlockAck bitmaps.
+	BA32BitBitmap bool
+
+	// Device supports MU cascading.
+	MUCascading bool
+
+	// Device supports ack-enabled aggregation.
+	AckEnabledAggregation bool
+
+	// Device supports the OM (Operating Mode) Control subfield.
+	OMControl bool
+
+	// Device supports OFDMA random access.
+	OFDMARA bool
+
+	// Extension to the maximum A-MPDU (Aggregated MAC Protocol Data Unit)
+	// length exponent advertised in the device's HT or VHT capabilities.
+	// Valid values are 0 through 3.
+	MaxAMPDULengthExponentExt int
+
+	// Device supports A-MSDU fragmentation.
+	AMSDUFragmentation bool
+
+	// Device supports flexible TWT (Target Wake Time) scheduling.
+	FlexibleTWTScheduling bool
+
+	// Device supports receiving control frames from a different BSS of a
+	// multiple BSSID set.
+	RxControlFrameToMultiBSS bool
+
+	// Device supports aggregating BSRP (Buffer Status Report Poll) and BQRP
+	// (Bandwidth Query Report Poll) frames in an A-MPDU.
+	BSRPBQRPAMPDUAggregation bool
+
+	// Device supports the quiet time period.
+	QTP bool
+
+	// Device supports the BQR (Bandwidth Query Report) variant of the
+	// A-Control field.
+	BQR bool
+
+	// Device supports the PSR (Parameterized Spatial Reuse) responder role.
+	PSRResponder bool
+
+	// Device supports NDP (Null Data Packet) feedback reports.
+	NDPFeedbackReport bool
+
+	// Device supports OPS (Opportunistic Power Save).
+	OPS bool
+
+	// Device supports carrying an A-MSDU in an A-MPDU acknowledged by a
+	// BlockAck frame.
+	AMSDUInAMPDU bool
+
+	// The number of TIDs (Traffic Identifiers) the device supports
+	// aggregating in a transmitted A-MPDU, minus one.
+	MultiTIDAggregationTx int
+
+	// Device supports HE subchannel selective transmission.
+	SubchannelSelectiveTransmission bool
+
+	// Device supports uplink 2x996-tone RUs (Resource Units).
+	UL2x996ToneRU bool
+
+	// Device supports disabling uplink MU data reception using the OM
+	// Control subfield.
+	OMControlULMUDataDisableRx bool
+
+	// Device supports HE dynamic SM (Spatial Multiplexing) power save.
+	DynamicSMPowerSave bool
+
+	// Device supports punctured sounding.
+	PuncturedSounding bool
+
+	// Device supports receiving trigger frames in HT and VHT PPDUs.
+	HTVHTTriggerFrameRx bool
+
+	// Fields of the HE PHY Capabilities Information field (9.4.2.248.3).
+
+	// Device supports 40MHz channels in the 2.4GHz band.
+	Support40MHzIn2GHz bool
+
+	// Device supports 40MHz and 80MHz channels in the 5GHz and 6GHz bands.
+	Support40MHz80MHzIn5GHz bool
+
+	// Device supports 160MHz channels in the 5GHz and 6GHz bands.
+	Support160MHzIn5GHz bool
+
+	// Device supports 80+80MHz channels in the 5GHz and 6GHz bands.
+	Support80Plus80MHzIn5GHz bool
+
+	// Device supports 242-tone RUs (Resource Units) in the 2.4GHz band.
+	Support242ToneRUIn2GHz bool
+
+	// Device supports 242-tone RUs (Resource Units) in the 5GHz and 6GHz
+	// bands.
+	Support242ToneRUIn5GHz bool
+
+	// The punctured preamble patterns the device supports receiving, as a
+	// bitmap: bits 0 and 1 for 80MHz channels with the secondary 20MHz or
+	// 40MHz punctured, and bits 2 and 3 for the same in 160MHz and 80+80MHz
+	// channels.
+	PuncturedPreambleRx int
+
+	// Device is a class A (rather than class B) device.
+	DeviceClassA bool
+
+	// Device supports LDPC (Low Density Parity Check) coding in the
+	// payload.
+	LDPCCodingInPayload bool
+
+	// Device supports HE SU PPDUs with one HE-LTF (Long Training Field)
+	// symbol and a 0.8us guard interval.
+	HESUPPDU1xHELTFAnd08usGI bool
+
+	// The maximum number of space-time streams the device supports for
+	// receiving a midamble, minus one.
+	MidambleRxMaxNSTS int
+
+	// Device supports NDP (Null Data Packet) frames with four HE-LTF
+	// symbols and a 3.2us guard interval.
+	NDP4xHELTFAnd32usGI bool
+
+	// Device supports transmitting and receiving STBC (Space-Time Block
+	// Coding) in channels of 80MHz and below.
+	STBCTx80MHz bool
+	STBCRx80MHz bool
+
+	// Device supports transmitting and receiving in a Doppler mode.
+	DopplerTx bool
+	DopplerRx bool
+
+	// Device supports full bandwidth and partial bandwidth UL (uplink)
+	// MU-MIMO.  For an access point these indicate reception, and for a
+	// station transmission.
+	FullBandwidthULMUMIMO    bool
+	PartialBandwidthULMUMIMO bool
+
+	// The maximum constellation the device supports for DCM (Dual Carrier
+	// Modulation) transmission and reception: 0 (no DCM), 1 (BPSK), 2
+	// (QPSK) or 3 (16-QAM).
+	DCMMaxConstellationTx int
+	DCMMaxConstellationRx int
+
+	// The maximum number of spatial streams the device supports for DCM
+	// transmission and reception, minus one.
+	DCMMaxNSSTx int
+	DCMMaxNSSRx int
+
+	// Device supports receiving a partial bandwidth SU PPDU within a 20MHz
+	// HE MU PPDU sent by a station other than an access point.
+	RxPartialBandwidthSUIn20MHzMU bool
+
+	// Device supports SU (Single User) beamforming as a transmitter and as
+	// a receiver, and MU (Multi User) beamforming as a transmitter.
+	SUBeamformer bool
+	SUBeamformee bool
+	MUBeamformer bool
+
+	// The maximum number of space-time streams the device supports as a
+	// beamformee, minus one, in channels of 80MHz and below and in wider
+	// channels respectively.
+	BeamformeeSTS80MHz      int
+	BeamformeeSTSAbove80MHz int
+
+	// The number of sounding dimensions the device supports as a
+	// beamformer, minus one, in channels of 80MHz and below and in wider
+	// channels respectively.
+	SoundingDimensions80MHz      int
+	SoundingDimensionsAbove80MHz int
+
+	// Device supports subcarrier grouping of 16 (Ng = 16) for SU and MU
+	// beamforming feedback.
+	NG16SUFeedback bool
+	NG16MUFeedback bool
+
+	// Device supports codebook size (4, 2) for SU beamforming feedback and
+	// (7, 5) for MU beamforming feedback.
+	Codebook42SUFeedback bool
+	Codebook75MUFeedback bool
+
+	// Device supports triggered SU beamforming feedback, triggered MU
+	// beamforming partial bandwidth feedback, and triggered CQI (Channel
+	// Quality Indicator) feedback.
+	TriggeredSUBeamformingFeedback          bool
+	TriggeredMUBeamformingPartialBWFeedback bool
+	TriggeredCQIFeedback                    bool
+
+	// Device supports partial bandwidth extended range transmission.
+	PartialBandwidthExtendedRange bool
+
+	// Device supports partial bandwidth DL (downlink) MU-MIMO.
+	PartialBandwidthDLMUMIMO bool
+
+	// PPE (Packet Padding Extension) thresholds are present in
+	// PPEThresholds.
+	PPEThresholdsPresent bool
+
+	// Device supports PSR (Parameterized Spatial Reuse) based spatial
+	// reuse.
+	PSRBasedSR bool
+
+	// Device supports the power boost factor.
+	PowerBoostFactor bool
+
+	// Device supports HE SU and HE MU PPDUs with four HE-LTF symbols and a
+	// 0.8us guard interval.
+	HESUMUPPDU4xHELTFAnd08usGI bool
+
+	// The maximum number of columns (Nc) the device supports in a
+	// compressed beamforming feedback matrix, minus one.
+	MaxNc int
+
+	// Device supports transmitting and receiving STBC (Space-Time Block
+	// Coding) in channels wider than 80MHz.
+	STBCTxAbove80MHz bool
+	STBCRxAbove80MHz bool
+
+	// Device supports HE ER (Extended Range) SU PPDUs with four HE-LTF
+	// symbols and a 0.8us guard interval.
+	HEERSUPPDU4xHELTFAnd08usGI bool
+
+	// Device supports receiving a 20MHz HE PPDU in a 40MHz channel in the
+	// 2.4GHz band.
+	Support20MHzIn40MHzHEPPDUIn2GHz bool
+
+	// Device supports receiving a 20MHz or 80MHz HE PPDU in a 160MHz or
+	// 80+80MHz channel.
+	Support20MHzIn160MHzHEPPDU bool
+	Support80MHzIn160MHzHEPPDU bool
+
+	// Device supports HE ER (Extended Range) SU PPDUs with one HE-LTF
+	// symbol and a 0.8us guard interval.
+	HEERSUPPDU1xHELTFAnd08usGI bool
+
+	// Device supports midamble reception with 2x and 1x HE-LTF symbols.
+	MidambleRx2xAnd1xHELTF bool
+
+	// The largest RU (Resource Unit) in which the device supports DCM (Dual
+	// Carrier Modulation): 0 (242 tones), 1 (484 tones), 2 (996 tones) or 3
+	// (2x996 tones).
+	DCMMaxRU int
+
+	// Device supports HE MU PPDUs with more than 16 HE SIG-B OFDM symbols.
+	LongerThan16HESIGBOFDMSymbols bool
+
+	// Device supports non-triggered CQI (Channel Quality Indicator)
+	// feedback.
+	NonTriggeredCQIFeedback bool
+
+	// Device supports transmitting and receiving 1024-QAM in RUs smaller
+	// than 242 tones.
+	Tx1024QAMLess242ToneRU bool
+	Rx1024QAMLess242ToneRU bool
+
+	// Device supports receiving a full bandwidth SU PPDU using an HE MU
+	// PPDU with a compressed or non-compressed HE SIG-B field.
+	RxFullBWSUUsingMUCompressedSIGB    bool
+	RxFullBWSUUsingMUNonCompressedSIGB bool
+
+	// The nominal packet padding the device requires, in microseconds.
+	// Valid values are 0, 8 and 16; the reserved encoding is reported as 0.
+	NominalPacketPadding int
+
+	// Device limits the number of HE-LTF symbols of an HE MU PPDU with more
+	// than one RU to the maximum for its bandwidth.
+	HEMUM1RUMaxLTF bool
+
+	// The highest MCS index the device supports for each number of spatial
+	// streams, for each channel width it supports.
+	SupportedMCSSets []HEMCSNSSSet
+
+	// The raw Supported HE-MCS And NSS Set field, from which
+	// SupportedMCSSets is decoded (802.11ax, 9.4.2.248.4).
+	SupportedMCS []byte
+
+	// The raw HE PPE Thresholds field (802.11ax, 9.4.2.248.5), or nil when
+	// PPEThresholdsPresent is not set.  The kernel reports these as a
+	// fixed-size buffer rather than trimming them, so this may hold
+	// trailing padding beyond the thresholds themselves.
+	//
+	// Todo:
+	//  - Parse the per-NSS, per-RU thresholds it packs, which also yields
+	//    the length of the meaningful data.
+	PPEThresholds []byte
+
+	// The device's 6GHz band capabilities, only present for a band in the
+	// 6GHz range (nil otherwise).
+	HE6GHzCapabilities *HE6GHzCapabilities
+}
+
+// An HEMCSNSSSet reports the highest MCS index an 802.11ax device supports for
+// each number of spatial streams at a given channel width.
+type HEMCSNSSSet struct {
+	// The channel width this set applies to: ChannelWidth80, which covers
+	// all channels of 80MHz and below, ChannelWidth160 or
+	// ChannelWidth80P80.  A device which supports no width beyond 20MHz
+	// reports its mandatory first set as ChannelWidth20.
+	Width ChannelWidth
+
+	// The highest MCS index the device supports for reception and for
+	// transmission with each number of spatial streams, indexed by the
+	// number of spatial streams minus one.  Valid values are 7, 9 and 11,
+	// or -1 when the device does not support that number of streams.
+	RxHighestMCS [8]int
+	TxHighestMCS [8]int
+}
+
+// HE6GHzCapabilities represents the 802.11ax capabilities which are specific to
+// the 6GHz band, in which a device has no HT or VHT capabilities element to
+// carry them.
+//
+// The fields represent those in the HE 6GHz Band Capabilities element
+// (802.11ax, 9.4.2.263).
+type HE6GHzCapabilities struct {
+	// Minimum spacing the device requires between A-MPDU frames.
+	MinMPDUStartSpacing time.Duration
+
+	// Maximum receivable A-MPDU (Aggregated MAC Protocol Data Unit) frame
+	// size, in bytes.
+	MaxRxAMPDULength int
+
+	// Maximum MPDU length supported by the device, in bytes.  The reserved
+	// encoding is reported as 0.
+	MaxMPDULength int
+
+	// The device's SM (Spatial Multiplexing) power save mode: 0 (static), 1
+	// (dynamic), 2 (reserved) or 3 (disabled).
+	SMPowerSave int
+
+	// Device supports acting as an RD (Reverse Direction) responder.
+	RDResponder bool
+
+	// Device supports receive and transmit antenna pattern consistency.
+	RXAntennaPattern bool
+	TXAntennaPattern bool
+}
+
+// EHTCapabilities represents 802.11be (Extremely High Throughput, WiFi 7)
+// capabilities.  These are specific to a band, as HT and VHT capabilities are,
+// but 802.11be also allows them to vary with the role an interface operates in,
+// so a band may report several sets of them.  Failure to support any given
+// attribute may be due to lack of support in the driver or the firmware, not
+// only in the hardware.
+//
+// The fields represent those in the EHT Capabilities element (802.11be,
+// 9.4.2.313).
+type EHTCapabilities struct {
+	// The interface types these capabilities apply to, which identify this
+	// set within its band.  An interface type belongs to at most one set:
+	// the kernel refuses to register a device which reports otherwise.
+	//
+	// Interfaces of type InterfaceTypeAPVLAN are never listed, and use the
+	// capabilities reported for InterfaceTypeAP.
+	InterfaceTypes []InterfaceType
+
+	// Fields of the EHT MAC Capabilities Information field (9.4.2.313.2).
+
+	// Device supports EPCS (Emergency Preparedness Communications Service)
+	// priority access.
+	EPCSPriorityAccess bool
+
+	// Device supports the EHT OM (Operating Mode) Control subfield.
+	OMControl bool
+
+	// Device supports triggered TXOP sharing mode 1, in which the shared
+	// TXOP may only be used for non-triggered frame exchanges.
+	TriggeredTXOPSharingMode1 bool
+
+	// Device supports triggered TXOP sharing mode 2, in which the shared
+	// TXOP may also be used for triggered frame exchanges.
+	TriggeredTXOPSharingMode2 bool
+
+	// Device supports restricted TWT (Target Wake Time).
+	RestrictedTWT bool
+
+	// Device supports SCS (Stream Classification Service) traffic
+	// descriptions.
+	SCSTrafficDescription bool
+
+	// Maximum MPDU length supported by the device, in bytes.  The reserved
+	// encoding is reported as 0.
+	MaxMPDULength int
+
+	// Extension to the maximum A-MPDU (Aggregated MAC Protocol Data Unit)
+	// length exponent advertised in the device's HE capabilities.  Valid
+	// values are 0 and 1.
+	MaxAMPDULengthExponentExt int
+
+	// Device supports the EHT TRS (Triggered Response Scheduling) subfield.
+	TRS bool
+
+	// Device supports returning the unused portion of a TXOP shared using
+	// triggered TXOP sharing mode 2.
+	TXOPReturn bool
+
+	// Device supports two BQRs (Bandwidth Query Reports) in an A-Control
+	// field.
+	TwoBQRs bool
+
+	// The type of EHT link adaptation supported by the device.  Valid
+	// values are 0 (not supported), 2 (unsolicited feedback) and 3 (both
+	// solicited and unsolicited feedback).
+	LinkAdaptation int
+
+	// Device supports unsolicited EPCS priority access.
+	UnsolicitedEPCSPriorityAccess bool
+
+	// Fields of the EHT PHY Capabilities Information field (9.4.2.313.3).
+
+	// Device supports 320MHz channel width in the 6GHz band.
+	Support320MHzIn6GHz bool
+
+	// Device supports 242-tone RUs (Resource Units) in channels wider than
+	// 20MHz.
+	Support242ToneRUWiderThan20MHz bool
+
+	// Device supports NDP (Null Data Packet) frames with four EHT-LTF
+	// (Long Training Field) symbols and a 3.2us guard interval.
+	NDP4xEHTLTFAnd32usGI bool
+
+	// Device supports partial bandwidth UL (uplink) MU-MIMO.
+	PartialBandwidthULMUMIMO bool
+
+	// Device supports SU (Single User) beamforming as a transmitter.
+	SUBeamformer bool
+
+	// Device supports SU (Single User) beamforming as a receiver.
+	SUBeamformee bool
+
+	// Number of spatial streams the device supports as a beamformee, minus
+	// one, in channels of 80MHz and below, of 160MHz and of 320MHz
+	// respectively.
+	BeamformeeSS80MHz  int
+	BeamformeeSS160MHz int
+	BeamformeeSS320MHz int
+
+	// Number of sounding dimensions the device supports as a beamformer,
+	// minus one, in channels of 80MHz and below, of 160MHz and of 320MHz
+	// respectively.
+	SoundingDimensions80MHz  int
+	SoundingDimensions160MHz int
+	SoundingDimensions320MHz int
+
+	// Device supports subcarrier grouping of 16 (Ng = 16) for SU
+	// beamforming feedback.
+	NG16SUFeedback bool
+
+	// Device supports subcarrier grouping of 16 (Ng = 16) for MU
+	// beamforming feedback.
+	NG16MUFeedback bool
+
+	// Device supports codebook size (4, 2) for SU beamforming feedback.
+	Codebook42SUFeedback bool
+
+	// Device supports codebook size (7, 5) for MU beamforming feedback.
+	Codebook75MUFeedback bool
+
+	// Device supports triggered SU beamforming feedback.
+	TriggeredSUBeamformingFeedback bool
+
+	// Device supports triggered MU beamforming partial bandwidth feedback.
+	TriggeredMUBeamformingPartialBWFeedback bool
+
+	// Device supports triggered CQI (Channel Quality Indicator) feedback.
+	TriggeredCQIFeedback bool
+
+	// Device supports partial bandwidth DL (downlink) MU-MIMO.
+	PartialBandwidthDLMUMIMO bool
+
+	// Device supports PSR (Parameterized Spatial Reuse) based spatial
+	// reuse.
+	PSRBasedSR bool
+
+	// Device supports the power boost factor.
+	PowerBoostFactor bool
+
+	// Device supports EHT MU PPDUs with four EHT-LTF symbols and a 0.8us
+	// guard interval.
+	EHTMUPPDU4xEHTLTFAnd08usGI bool
+
+	// Maximum number of columns (Nc) the device supports in a compressed
+	// beamforming feedback matrix, minus one.
+	MaxNc int
+
+	// Device supports non-triggered CQI feedback.
+	NonTriggeredCQIFeedback bool
+
+	// Device supports transmitting 1024-QAM and 4096-QAM in RUs smaller
+	// than 242 tones.
+	TxLess242ToneRU bool
+
+	// Device supports receiving 1024-QAM and 4096-QAM in RUs smaller than
+	// 242 tones.
+	RxLess242ToneRU bool
+
+	// PPE (Packet Padding Extension) thresholds are present in
+	// PPEThresholds.
+	PPEThresholdsPresent bool
+
+	// The common nominal packet padding the device requires, in
+	// microseconds.  Valid values are 0, 8, 16 and 20.
+	CommonNominalPacketPadding int
+
+	// The Maximum Number Of Supported EHT-LTFs subfield, which encodes the
+	// maximum number of EHT-LTF symbols the device supports in an EHT PPDU.
+	MaxSupportedEHTLTFs int
+
+	// The bandwidths in which the device supports MCS 15, as a bitmap: bit
+	// 0 for MRU sizes up to 80MHz, bits 1 and 2 for 160MHz, and bit 3 for
+	// 320MHz.
+	MCS15Support int
+
+	// Device supports EHT DUP (duplicate) transmission in the 6GHz band.
+	EHTDupIn6GHz bool
+
+	// Device supports receiving an NDP of a wider bandwidth than the
+	// operating 20MHz channel.
+	Support20MHzRxNDPWiderBandwidth bool
+
+	// Device supports non-OFDMA UL MU-MIMO in channels of 80MHz and below,
+	// of 160MHz and of 320MHz respectively.
+	NonOFDMAULMUMIMO80MHz  bool
+	NonOFDMAULMUMIMO160MHz bool
+	NonOFDMAULMUMIMO320MHz bool
+
+	// Device supports MU beamforming in channels of 80MHz and below, of
+	// 160MHz and of 320MHz respectively.
+	MUBeamformer80MHz  bool
+	MUBeamformer160MHz bool
+	MUBeamformer320MHz bool
+
+	// Device applies a rate limit to TB (Trigger Based) sounding feedback.
+	TBSoundingFeedbackRateLimit bool
+
+	// Device supports receiving 1024-QAM in a DL OFDMA transmission wider
+	// than the PPDU bandwidth.
+	Rx1024QAMWiderBandwidthDLOFDMA bool
+
+	// Device supports receiving 4096-QAM in a DL OFDMA transmission wider
+	// than the PPDU bandwidth.
+	Rx4096QAMWiderBandwidthDLOFDMA bool
+
+	// The maximum number of spatial streams the device supports for each
+	// range of MCS indices, for each channel width it supports.
+	SupportedMCSSets []EHTMCSNSSSet
+
+	// The raw Supported EHT-MCS And NSS Set field, from which
+	// SupportedMCSSets is decoded (802.11be, 9.4.2.313.4).
+	SupportedMCS []byte
+
+	// The raw EHT PPE Thresholds field (802.11be, 9.4.2.313.5), or nil when
+	// PPEThresholdsPresent is not set.
+	//
+	// Todo:
+	//  - Parse the per-NSS, per-RU thresholds it packs.
+	PPEThresholds []byte
+}
+
+// An EHTMCSNSSSet reports the maximum number of spatial streams an 802.11be
+// device supports at a given channel width.
+type EHTMCSNSSSet struct {
+	// The channel width this set applies to.  ChannelWidth20 indicates the
+	// map reported by a station which only supports 20MHz channels, and
+	// ChannelWidth80 covers all channels of 80MHz and below.
+	Width ChannelWidth
+
+	// The maximum number of spatial streams supported for each range of MCS
+	// indices at this channel width.
+	MCSRanges []EHTMCSNSS
+}
+
+// An EHTMCSNSS reports the maximum number of spatial streams an 802.11be device
+// supports for a range of EHT MCS indices.
+type EHTMCSNSS struct {
+	// The inclusive bounds of the range of MCS indices.
+	MinMCS int
+	MaxMCS int
+
+	// The maximum number of spatial streams supported for reception and for
+	// transmission of the MCS range.  Zero means the range is unsupported.
+	RxMaxNSS int
+	TxMaxNSS int
 }
 
 // FrequencyAttrs represents the attributes of a WiFi frequency/channel.
