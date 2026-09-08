@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"slices"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -927,11 +928,21 @@ func (p *PHY) parseBandAttributes(nlband netlink.Attribute) error {
 				ba.HTCapabilities = new(HTCapabilities)
 			}
 			copy(ba.HTCapabilities.SupportedMCS[:], attr.Data)
+			decodeHTMCSSet(ba.HTCapabilities)
 		case unix.NL80211_BAND_ATTR_VHT_MCS_SET:
 			if ba.VHTCapabilities == nil {
 				ba.VHTCapabilities = new(VHTCapabilities)
 			}
 			copy(ba.VHTCapabilities.SupportedMCS[:], attr.Data)
+			decodeVHTMCSSet(ba.VHTCapabilities)
+
+		case unix.NL80211_BAND_ATTR_IFTYPE_DATA:
+			hecaps, ehtcaps, err := parseBandIftypeData(attr.Data)
+			if err != nil {
+				return err
+			}
+			ba.HECapabilities = hecaps
+			ba.EHTCapabilities = ehtcaps
 
 		case unix.NL80211_BAND_ATTR_RATES:
 			nattrs, err := netlink.UnmarshalAttributes(attr.Data)
@@ -1022,6 +1033,36 @@ func decodeHTCapabilities(htcap *HTCapabilities, capability uint16) *HTCapabilit
 	return htcap
 }
 
+// Number of MCS indices in the receive bitmask of an HT Supported MCS Set
+// field; the remaining bits of its ten octets are reserved.
+const htMCSMaskBits = 77
+
+// decodeHTMCSSet parses the Supported MCS Set field of an HT Capabilities
+// element (NL80211_BAND_ATTR_HT_MCS_SET) into an HTCapabilities struct, from
+// the raw field already stored in it.  Its multi-octet values are little
+// endian, unlike the capability bits nl80211 sends as a native endian integer.
+func decodeHTMCSSet(htcap *HTCapabilities) {
+	mcs := htcap.SupportedMCS
+
+	// One bit per MCS index, from the least significant bit of the first
+	// octet.
+	var rx []int
+	for i := range htMCSMaskBits {
+		if mcs[i/8]&(1<<(i%8)) != 0 {
+			rx = append(rx, i)
+		}
+	}
+	htcap.RxMCS = rx
+
+	htcap.RxHighestRate = int(binary.LittleEndian.Uint16(mcs[10:]) & 0x3ff)
+
+	htcap.TxMCSSetDefined = mcs[12]&(1<<0) != 0
+	htcap.TxRxMCSSetNotEqual = mcs[12]&(1<<1) != 0
+	// The field holds the number of streams minus one.
+	htcap.TxMaxSpatialStreams = int((mcs[12]>>2)&0x3) + 1
+	htcap.TxUnequalModulation = mcs[12]&(1<<4) != 0
+}
+
 // decodeVHTCapabilities parses a 32-bit integer into an VHTCapabilities struct
 // based on information from an VHT Capabilities Info field (NL80211_BAND_ATTR_VHT_CAPA).
 // Create a new one if nil is passed in, but allow for the struct to have other
@@ -1060,6 +1101,682 @@ func decodeVHTCapabilities(vhtcap *VHTCapabilities, capability uint32) *VHTCapab
 	vhtcap.ExtendedNSSBW = int((capability >> 30) & 0x7)
 
 	return vhtcap
+}
+
+// decodeVHTMCSSet parses the VHT Supported MCS Set field
+// (NL80211_BAND_ATTR_VHT_MCS_SET) into a VHTCapabilities struct, from the raw
+// field already stored in it.  It holds four little endian values: a map of the
+// MCS indices supported for reception and the highest rate for reception,
+// followed by the same pair for transmission.
+func decodeVHTMCSSet(vhtcap *VHTCapabilities) {
+	mcs := vhtcap.SupportedMCS
+
+	vhtcap.RxHighestMCS = decodeVHTMCSMap(binary.LittleEndian.Uint16(mcs[0:]))
+
+	rxHighest := binary.LittleEndian.Uint16(mcs[2:])
+	vhtcap.RxHighestRate = int(rxHighest & 0x1fff)
+	vhtcap.MaxNSTSTotal = int((rxHighest >> 13) & 0x7)
+
+	vhtcap.TxHighestMCS = decodeVHTMCSMap(binary.LittleEndian.Uint16(mcs[4:]))
+
+	txHighest := binary.LittleEndian.Uint16(mcs[6:])
+	vhtcap.TxHighestRate = int(txHighest & 0x1fff)
+	vhtcap.ExtendedNSSBWCapable = txHighest&(1<<13) != 0
+}
+
+// decodeVHTMCSMap parses a VHT MCS map, which holds two bits per number of
+// spatial streams encoding the highest MCS index supported with that number of
+// streams.
+func decodeVHTMCSMap(m uint16) [8]int {
+	var highest [8]int
+
+	for i := range highest {
+		switch v := (m >> (2 * i)) & 0x3; v {
+		case 3:
+			// The device does not support this number of streams.
+			highest[i] = -1
+		default:
+			// 0, 1 and 2 encode MCS 0-7, 0-8 and 0-9.
+			highest[i] = 7 + int(v)
+		}
+	}
+
+	return highest
+}
+
+// errInvalidHECapabilities is returned when the kernel reports HE capability
+// fields which are too short to decode.
+var errInvalidHECapabilities = errors.New("invalid HE capabilities")
+
+const (
+	// Lengths in bytes of the fixed-size fields of an HE Capabilities
+	// element (802.11ax, 9.4.2.248), and of the HE 6GHz Band Capabilities
+	// element (9.4.2.263).
+	heMACCapLen   = 6
+	hePHYCapLen   = 11
+	he6GHzCapaLen = 2
+
+	// Length in bytes of one HE-MCS map, which holds two bits per number of
+	// spatial streams.
+	heMCSMapLen = 2
+
+	// Number of spatial streams described by an HE-MCS map.
+	heMCSMapNSS = 8
+)
+
+// errInvalidEHTCapabilities is returned when the kernel reports EHT capability
+// fields which are too short to decode.
+var errInvalidEHTCapabilities = errors.New("invalid EHT capabilities")
+
+const (
+	// Lengths in bytes of the fixed-size fields of an EHT Capabilities
+	// element (802.11be, 9.4.2.313).
+	ehtMACCapLen = 2
+	ehtPHYCapLen = 9
+
+	// Length in bytes of a single EHT-MCS map.
+	ehtMCSMapLen = 3
+
+	// Channel width set bits of the first byte of the HE PHY capabilities,
+	// which select the maps present in the Supported HE-MCS And NSS Set and
+	// Supported EHT-MCS And NSS Set fields.
+	hePHYCap040MHzIn2GHz       = 1 << 1
+	hePHYCap040MHz80MHzIn5GHz  = 1 << 2
+	hePHYCap0160MHzIn5GHz      = 1 << 3
+	hePHYCap080Plus80MHzIn5GHz = 1 << 4
+
+	// 320MHz support in the first byte of the EHT PHY capabilities, which
+	// adds a further map to the Supported EHT-MCS And NSS Set field.
+	ehtPHYCap0320MHzIn6GHz = 1 << 1
+)
+
+// parseBandIftypeData parses the per-interface type data of a band
+// (NL80211_BAND_ATTR_IFTYPE_DATA) into the HE and EHT capabilities it
+// advertises, one element for each set of interface types which share the same
+// capabilities.  Sets which advertise no capabilities of a given generation are
+// skipped, so either result is nil for a band which does not support it.
+func parseBandIftypeData(b []byte) ([]HECapabilities, []EHTCapabilities, error) {
+	iftypes, err := netlink.UnmarshalAttributes(b)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var (
+		hecaps  []HECapabilities
+		ehtcaps []EHTCapabilities
+	)
+
+	for _, iftype := range iftypes {
+		attrs, err := netlink.UnmarshalAttributes(iftype.Data)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		var (
+			types []InterfaceType
+
+			hecap  HECapabilities
+			ehtcap EHTCapabilities
+
+			hasHE  bool
+			hasEHT bool
+
+			// Retained to decode the Supported HE-MCS And NSS Set
+			// and Supported EHT-MCS And NSS Set fields, whose
+			// layouts depend on them.
+			hePHYCap  []byte
+			ehtPHYCap []byte
+		)
+
+		for _, a := range attrs {
+			switch a.Type {
+			case unix.NL80211_BAND_IFTYPE_ATTR_IFTYPES:
+				// This contains nested attributes with no data;
+				// the data we care about is the type.
+				nattrs, err := netlink.UnmarshalAttributes(a.Data)
+				if err != nil {
+					return nil, nil, err
+				}
+				for _, t := range nattrs {
+					types = append(types, InterfaceType(t.Type))
+				}
+
+			case unix.NL80211_BAND_IFTYPE_ATTR_HE_CAP_MAC:
+				if len(a.Data) < heMACCapLen {
+					return nil, nil, errInvalidHECapabilities
+				}
+				decodeHEMACCapabilities(&hecap, a.Data)
+				hasHE = true
+
+			case unix.NL80211_BAND_IFTYPE_ATTR_HE_CAP_PHY:
+				if len(a.Data) < hePHYCapLen {
+					return nil, nil, errInvalidHECapabilities
+				}
+				decodeHEPHYCapabilities(&hecap, a.Data)
+				hePHYCap = a.Data
+				hasHE = true
+
+			case unix.NL80211_BAND_IFTYPE_ATTR_HE_CAP_MCS_SET:
+				hecap.SupportedMCS = slices.Clone(a.Data)
+
+			case unix.NL80211_BAND_IFTYPE_ATTR_HE_CAP_PPE:
+				hecap.PPEThresholds = slices.Clone(a.Data)
+
+			case unix.NL80211_BAND_IFTYPE_ATTR_HE_6GHZ_CAPA:
+				if len(a.Data) < he6GHzCapaLen {
+					return nil, nil, errInvalidHECapabilities
+				}
+				hecap.HE6GHzCapabilities = decodeHE6GHzCapabilities(
+					binary.LittleEndian.Uint16(a.Data),
+				)
+
+			case unix.NL80211_BAND_IFTYPE_ATTR_EHT_CAP_MAC:
+				if len(a.Data) < ehtMACCapLen {
+					return nil, nil, errInvalidEHTCapabilities
+				}
+				decodeEHTMACCapabilities(&ehtcap, a.Data)
+				hasEHT = true
+
+			case unix.NL80211_BAND_IFTYPE_ATTR_EHT_CAP_PHY:
+				if len(a.Data) < ehtPHYCapLen {
+					return nil, nil, errInvalidEHTCapabilities
+				}
+				decodeEHTPHYCapabilities(&ehtcap, a.Data)
+				ehtPHYCap = a.Data
+				hasEHT = true
+
+			case unix.NL80211_BAND_IFTYPE_ATTR_EHT_CAP_MCS_SET:
+				ehtcap.SupportedMCS = slices.Clone(a.Data)
+
+			case unix.NL80211_BAND_IFTYPE_ATTR_EHT_CAP_PPE:
+				ehtcap.PPEThresholds = slices.Clone(a.Data)
+			}
+		}
+
+		if hasHE {
+			hecap.InterfaceTypes = slices.Clone(types)
+			hecap.SupportedMCSSets = decodeHEMCSNSSSets(hecap.SupportedMCS, hePHYCap)
+
+			// The kernel always sends the thresholds, as a
+			// fixed-size buffer, so drop them unless the device
+			// says they hold anything.
+			if !hecap.PPEThresholdsPresent {
+				hecap.PPEThresholds = nil
+			}
+
+			hecaps = append(hecaps, hecap)
+		}
+
+		if hasEHT {
+			ehtcap.InterfaceTypes = slices.Clone(types)
+
+			// The kernel sends a zero length attribute rather than
+			// omitting it, so normalise the empty case to nil.
+			if !ehtcap.PPEThresholdsPresent {
+				ehtcap.PPEThresholds = nil
+			}
+
+			ehtcap.SupportedMCSSets = decodeEHTMCSNSSSets(
+				ehtcap.SupportedMCS,
+				hePHYCap,
+				ehtPHYCap,
+				isAPInterfaceType(types),
+			)
+			ehtcaps = append(ehtcaps, ehtcap)
+		}
+	}
+
+	return hecaps, ehtcaps, nil
+}
+
+// isAPInterfaceType reports whether any of types transmits as an access point,
+// which changes the layout of the Supported EHT-MCS And NSS Set field.
+func isAPInterfaceType(types []InterfaceType) bool {
+	return slices.ContainsFunc(
+		types, func(t InterfaceType) bool {
+			return t == InterfaceTypeAP || t == InterfaceTypeP2PGroupOwner
+		},
+	)
+}
+
+// decodeHEMACCapabilities parses the six byte HE MAC Capabilities Information
+// field (NL80211_BAND_IFTYPE_ATTR_HE_CAP_MAC) into an HECapabilities struct.
+// Several of its subfields are split across two bytes.
+func decodeHEMACCapabilities(hecap *HECapabilities, mac []byte) {
+	hecap.HTCHE = mac[0]&(1<<0) != 0
+	hecap.TWTRequester = mac[0]&(1<<1) != 0
+	hecap.TWTResponder = mac[0]&(1<<2) != 0
+	hecap.DynamicFragmentation = int((mac[0] >> 3) & 0x3)
+	hecap.MaxFragmentedMSDUs = int((mac[0] >> 5) & 0x7)
+
+	switch mac[1] & 0x3 {
+	case 1:
+		hecap.MinFragmentSize = 128
+	case 2:
+		hecap.MinFragmentSize = 256
+	case 3:
+		hecap.MinFragmentSize = 512
+	}
+
+	switch (mac[1] >> 2) & 0x3 {
+	case 1:
+		hecap.TriggerFrameMACPaddingDuration = 8
+	case 2:
+		hecap.TriggerFrameMACPaddingDuration = 16
+	}
+
+	hecap.MultiTIDAggregationRx = int((mac[1] >> 4) & 0x7)
+	hecap.LinkAdaptation = int((mac[1]>>7)&0x1 | (mac[2]&0x1)<<1)
+
+	hecap.AllAck = mac[2]&(1<<1) != 0
+	hecap.TRS = mac[2]&(1<<2) != 0
+	hecap.BSR = mac[2]&(1<<3) != 0
+	hecap.BroadcastTWT = mac[2]&(1<<4) != 0
+	hecap.BA32BitBitmap = mac[2]&(1<<5) != 0
+	hecap.MUCascading = mac[2]&(1<<6) != 0
+	hecap.AckEnabledAggregation = mac[2]&(1<<7) != 0
+
+	hecap.OMControl = mac[3]&(1<<1) != 0
+	hecap.OFDMARA = mac[3]&(1<<2) != 0
+	hecap.MaxAMPDULengthExponentExt = int((mac[3] >> 3) & 0x3)
+	hecap.AMSDUFragmentation = mac[3]&(1<<5) != 0
+	hecap.FlexibleTWTScheduling = mac[3]&(1<<6) != 0
+	hecap.RxControlFrameToMultiBSS = mac[3]&(1<<7) != 0
+
+	hecap.BSRPBQRPAMPDUAggregation = mac[4]&(1<<0) != 0
+	hecap.QTP = mac[4]&(1<<1) != 0
+	hecap.BQR = mac[4]&(1<<2) != 0
+	hecap.PSRResponder = mac[4]&(1<<3) != 0
+	hecap.NDPFeedbackReport = mac[4]&(1<<4) != 0
+	hecap.OPS = mac[4]&(1<<5) != 0
+	hecap.AMSDUInAMPDU = mac[4]&(1<<6) != 0
+	hecap.MultiTIDAggregationTx = int((mac[4]>>7)&0x1 | (mac[5]&0x3)<<1)
+
+	hecap.SubchannelSelectiveTransmission = mac[5]&(1<<2) != 0
+	hecap.UL2x996ToneRU = mac[5]&(1<<3) != 0
+	hecap.OMControlULMUDataDisableRx = mac[5]&(1<<4) != 0
+	hecap.DynamicSMPowerSave = mac[5]&(1<<5) != 0
+	hecap.PuncturedSounding = mac[5]&(1<<6) != 0
+	hecap.HTVHTTriggerFrameRx = mac[5]&(1<<7) != 0
+}
+
+// decodeHEPHYCapabilities parses the eleven byte HE PHY Capabilities
+// Information field (NL80211_BAND_IFTYPE_ATTR_HE_CAP_PHY) into an
+// HECapabilities struct.
+func decodeHEPHYCapabilities(hecap *HECapabilities, phy []byte) {
+	hecap.Support40MHzIn2GHz = phy[0]&hePHYCap040MHzIn2GHz != 0
+	hecap.Support40MHz80MHzIn5GHz = phy[0]&hePHYCap040MHz80MHzIn5GHz != 0
+	hecap.Support160MHzIn5GHz = phy[0]&hePHYCap0160MHzIn5GHz != 0
+	hecap.Support80Plus80MHzIn5GHz = phy[0]&hePHYCap080Plus80MHzIn5GHz != 0
+	hecap.Support242ToneRUIn2GHz = phy[0]&(1<<5) != 0
+	hecap.Support242ToneRUIn5GHz = phy[0]&(1<<6) != 0
+
+	hecap.PuncturedPreambleRx = int(phy[1] & 0xf)
+	hecap.DeviceClassA = phy[1]&(1<<4) != 0
+	hecap.LDPCCodingInPayload = phy[1]&(1<<5) != 0
+	hecap.HESUPPDU1xHELTFAnd08usGI = phy[1]&(1<<6) != 0
+	hecap.MidambleRxMaxNSTS = int((phy[1]>>7)&0x1 | (phy[2]&0x1)<<1)
+
+	hecap.NDP4xHELTFAnd32usGI = phy[2]&(1<<1) != 0
+	hecap.STBCTx80MHz = phy[2]&(1<<2) != 0
+	hecap.STBCRx80MHz = phy[2]&(1<<3) != 0
+	hecap.DopplerTx = phy[2]&(1<<4) != 0
+	hecap.DopplerRx = phy[2]&(1<<5) != 0
+	hecap.FullBandwidthULMUMIMO = phy[2]&(1<<6) != 0
+	hecap.PartialBandwidthULMUMIMO = phy[2]&(1<<7) != 0
+
+	hecap.DCMMaxConstellationTx = int(phy[3] & 0x3)
+	hecap.DCMMaxNSSTx = int((phy[3] >> 2) & 0x1)
+	hecap.DCMMaxConstellationRx = int((phy[3] >> 3) & 0x3)
+	hecap.DCMMaxNSSRx = int((phy[3] >> 5) & 0x1)
+	hecap.RxPartialBandwidthSUIn20MHzMU = phy[3]&(1<<6) != 0
+	hecap.SUBeamformer = phy[3]&(1<<7) != 0
+
+	hecap.SUBeamformee = phy[4]&(1<<0) != 0
+	hecap.MUBeamformer = phy[4]&(1<<1) != 0
+	hecap.BeamformeeSTS80MHz = int((phy[4] >> 2) & 0x7)
+	hecap.BeamformeeSTSAbove80MHz = int((phy[4] >> 5) & 0x7)
+
+	hecap.SoundingDimensions80MHz = int(phy[5] & 0x7)
+	hecap.SoundingDimensionsAbove80MHz = int((phy[5] >> 3) & 0x7)
+	hecap.NG16SUFeedback = phy[5]&(1<<6) != 0
+	hecap.NG16MUFeedback = phy[5]&(1<<7) != 0
+
+	hecap.Codebook42SUFeedback = phy[6]&(1<<0) != 0
+	hecap.Codebook75MUFeedback = phy[6]&(1<<1) != 0
+	hecap.TriggeredSUBeamformingFeedback = phy[6]&(1<<2) != 0
+	hecap.TriggeredMUBeamformingPartialBWFeedback = phy[6]&(1<<3) != 0
+	hecap.TriggeredCQIFeedback = phy[6]&(1<<4) != 0
+	hecap.PartialBandwidthExtendedRange = phy[6]&(1<<5) != 0
+	hecap.PartialBandwidthDLMUMIMO = phy[6]&(1<<6) != 0
+	hecap.PPEThresholdsPresent = phy[6]&(1<<7) != 0
+
+	hecap.PSRBasedSR = phy[7]&(1<<0) != 0
+	hecap.PowerBoostFactor = phy[7]&(1<<1) != 0
+	hecap.HESUMUPPDU4xHELTFAnd08usGI = phy[7]&(1<<2) != 0
+	hecap.MaxNc = int((phy[7] >> 3) & 0x7)
+	hecap.STBCTxAbove80MHz = phy[7]&(1<<6) != 0
+	hecap.STBCRxAbove80MHz = phy[7]&(1<<7) != 0
+
+	hecap.HEERSUPPDU4xHELTFAnd08usGI = phy[8]&(1<<0) != 0
+	hecap.Support20MHzIn40MHzHEPPDUIn2GHz = phy[8]&(1<<1) != 0
+	hecap.Support20MHzIn160MHzHEPPDU = phy[8]&(1<<2) != 0
+	hecap.Support80MHzIn160MHzHEPPDU = phy[8]&(1<<3) != 0
+	hecap.HEERSUPPDU1xHELTFAnd08usGI = phy[8]&(1<<4) != 0
+	hecap.MidambleRx2xAnd1xHELTF = phy[8]&(1<<5) != 0
+	hecap.DCMMaxRU = int((phy[8] >> 6) & 0x3)
+
+	hecap.LongerThan16HESIGBOFDMSymbols = phy[9]&(1<<0) != 0
+	hecap.NonTriggeredCQIFeedback = phy[9]&(1<<1) != 0
+	hecap.Tx1024QAMLess242ToneRU = phy[9]&(1<<2) != 0
+	hecap.Rx1024QAMLess242ToneRU = phy[9]&(1<<3) != 0
+	hecap.RxFullBWSUUsingMUCompressedSIGB = phy[9]&(1<<4) != 0
+	hecap.RxFullBWSUUsingMUNonCompressedSIGB = phy[9]&(1<<5) != 0
+
+	switch (phy[9] >> 6) & 0x3 {
+	case 1:
+		hecap.NominalPacketPadding = 8
+	case 2:
+		hecap.NominalPacketPadding = 16
+	}
+
+	hecap.HEMUM1RUMaxLTF = phy[10]&(1<<0) != 0
+}
+
+// decodeHEMCSNSSSets parses the Supported HE-MCS And NSS Set field
+// (NL80211_BAND_IFTYPE_ATTR_HE_CAP_MCS_SET), which holds a pair of receive and
+// transmit maps for each channel width advertised in the HE PHY capabilities.
+func decodeHEMCSNSSSets(mcs, hePHYCap []byte) []HEMCSNSSSet {
+	if len(mcs) == 0 || len(hePHYCap) == 0 {
+		return nil
+	}
+
+	// The maps appear in this order, and only for the channel widths the
+	// device supports.
+	widths := []struct {
+		width ChannelWidth
+		capa  byte
+	}{
+		{ChannelWidth80, hePHYCap040MHzIn2GHz | hePHYCap040MHz80MHzIn5GHz},
+		{ChannelWidth160, hePHYCap0160MHzIn5GHz},
+		{ChannelWidth80P80, hePHYCap080Plus80MHzIn5GHz},
+	}
+
+	var sets []HEMCSNSSSet
+	for i, w := range widths {
+		// Each width occupies a receive and a transmit map, whether or
+		// not the device supports it.
+		off := i * 2 * heMCSMapLen
+		if len(mcs) < off+2*heMCSMapLen {
+			break
+		}
+
+		if hePHYCap[0]&w.capa == 0 {
+			continue
+		}
+
+		sets = append(
+			sets, HEMCSNSSSet{
+				Width:        w.width,
+				RxHighestMCS: decodeHEMCSMap(mcs[off:]),
+				TxHighestMCS: decodeHEMCSMap(mcs[off+heMCSMapLen:]),
+			},
+		)
+	}
+
+	// A device which supports no channel width beyond 20MHz still reports
+	// the first pair of maps, which is mandatory and describes its 20MHz
+	// operation.
+	if len(sets) == 0 && len(mcs) >= 2*heMCSMapLen {
+		return []HEMCSNSSSet{{
+			Width:        ChannelWidth20,
+			RxHighestMCS: decodeHEMCSMap(mcs),
+			TxHighestMCS: decodeHEMCSMap(mcs[heMCSMapLen:]),
+		}}
+	}
+
+	return sets
+}
+
+// decodeHEMCSMap parses a single HE-MCS map, which holds two bits per number of
+// spatial streams encoding the highest MCS index supported with that number of
+// streams.
+func decodeHEMCSMap(mcs []byte) [heMCSMapNSS]int {
+	var highest [heMCSMapNSS]int
+
+	m := binary.LittleEndian.Uint16(mcs)
+	for i := range highest {
+		switch v := (m >> (2 * i)) & 0x3; v {
+		case 3:
+			// The device does not support this number of streams.
+			highest[i] = -1
+		default:
+			// 0, 1 and 2 encode MCS 0-7, 0-9 and 0-11.
+			highest[i] = 7 + 2*int(v)
+		}
+	}
+
+	return highest
+}
+
+// decodeHE6GHzCapabilities parses the two byte HE 6GHz Band Capabilities
+// element (NL80211_BAND_IFTYPE_ATTR_HE_6GHZ_CAPA), which carries the attributes
+// a device would otherwise advertise in its HT and VHT capabilities.
+func decodeHE6GHzCapabilities(capa uint16) *HE6GHzCapabilities {
+	he6ghz := new(HE6GHzCapabilities)
+
+	if spacing := capa & 0x7; spacing > 0 {
+		he6ghz.MinMPDUStartSpacing = (1 << (spacing - 1)) * time.Microsecond / 4
+	}
+
+	he6ghz.MaxRxAMPDULength = (1 << (13 + (capa>>3)&0x7)) - 1
+
+	switch (capa >> 6) & 0x3 {
+	case 0:
+		he6ghz.MaxMPDULength = 3895
+	case 1:
+		he6ghz.MaxMPDULength = 7991
+	case 2:
+		he6ghz.MaxMPDULength = 11454
+	}
+
+	he6ghz.SMPowerSave = int((capa >> 9) & 0x3)
+	he6ghz.RDResponder = capa&(1<<11) != 0
+	he6ghz.RXAntennaPattern = capa&(1<<12) != 0
+	he6ghz.TXAntennaPattern = capa&(1<<13) != 0
+
+	return he6ghz
+}
+
+// decodeEHTMACCapabilities parses the two byte EHT MAC Capabilities Information
+// field (NL80211_BAND_IFTYPE_ATTR_EHT_CAP_MAC) into an EHTCapabilities struct.
+func decodeEHTMACCapabilities(ehtcap *EHTCapabilities, mac []byte) {
+	ehtcap.EPCSPriorityAccess = mac[0]&(1<<0) != 0
+	ehtcap.OMControl = mac[0]&(1<<1) != 0
+	ehtcap.TriggeredTXOPSharingMode1 = mac[0]&(1<<2) != 0
+	ehtcap.TriggeredTXOPSharingMode2 = mac[0]&(1<<3) != 0
+	ehtcap.RestrictedTWT = mac[0]&(1<<4) != 0
+	ehtcap.SCSTrafficDescription = mac[0]&(1<<5) != 0
+
+	switch (mac[0] >> 6) & 0x3 {
+	case 0:
+		ehtcap.MaxMPDULength = 3895
+	case 1:
+		ehtcap.MaxMPDULength = 7991
+	case 2:
+		ehtcap.MaxMPDULength = 11454
+	}
+
+	ehtcap.MaxAMPDULengthExponentExt = int(mac[1] & 0x1)
+	ehtcap.TRS = mac[1]&(1<<1) != 0
+	ehtcap.TXOPReturn = mac[1]&(1<<2) != 0
+	ehtcap.TwoBQRs = mac[1]&(1<<3) != 0
+	ehtcap.LinkAdaptation = int((mac[1] >> 4) & 0x3)
+	ehtcap.UnsolicitedEPCSPriorityAccess = mac[1]&(1<<6) != 0
+}
+
+// decodeEHTPHYCapabilities parses the nine byte EHT PHY Capabilities
+// Information field (NL80211_BAND_IFTYPE_ATTR_EHT_CAP_PHY) into an
+// EHTCapabilities struct.  Several of its subfields are split across two bytes.
+func decodeEHTPHYCapabilities(ehtcap *EHTCapabilities, phy []byte) {
+	ehtcap.Support320MHzIn6GHz = phy[0]&(1<<1) != 0
+	ehtcap.Support242ToneRUWiderThan20MHz = phy[0]&(1<<2) != 0
+	ehtcap.NDP4xEHTLTFAnd32usGI = phy[0]&(1<<3) != 0
+	ehtcap.PartialBandwidthULMUMIMO = phy[0]&(1<<4) != 0
+	ehtcap.SUBeamformer = phy[0]&(1<<5) != 0
+	ehtcap.SUBeamformee = phy[0]&(1<<6) != 0
+
+	ehtcap.BeamformeeSS80MHz = int((phy[0]>>7)&0x1 | (phy[1]&0x3)<<1)
+	ehtcap.BeamformeeSS160MHz = int((phy[1] >> 2) & 0x7)
+	ehtcap.BeamformeeSS320MHz = int((phy[1] >> 5) & 0x7)
+
+	ehtcap.SoundingDimensions80MHz = int(phy[2] & 0x7)
+	ehtcap.SoundingDimensions160MHz = int((phy[2] >> 3) & 0x7)
+	ehtcap.SoundingDimensions320MHz = int((phy[2]>>6)&0x3 | (phy[3]&0x1)<<2)
+
+	ehtcap.NG16SUFeedback = phy[3]&(1<<1) != 0
+	ehtcap.NG16MUFeedback = phy[3]&(1<<2) != 0
+	ehtcap.Codebook42SUFeedback = phy[3]&(1<<3) != 0
+	ehtcap.Codebook75MUFeedback = phy[3]&(1<<4) != 0
+	ehtcap.TriggeredSUBeamformingFeedback = phy[3]&(1<<5) != 0
+	ehtcap.TriggeredMUBeamformingPartialBWFeedback = phy[3]&(1<<6) != 0
+	ehtcap.TriggeredCQIFeedback = phy[3]&(1<<7) != 0
+
+	ehtcap.PartialBandwidthDLMUMIMO = phy[4]&(1<<0) != 0
+	ehtcap.PSRBasedSR = phy[4]&(1<<1) != 0
+	ehtcap.PowerBoostFactor = phy[4]&(1<<2) != 0
+	ehtcap.EHTMUPPDU4xEHTLTFAnd08usGI = phy[4]&(1<<3) != 0
+	ehtcap.MaxNc = int((phy[4] >> 4) & 0xf)
+
+	ehtcap.NonTriggeredCQIFeedback = phy[5]&(1<<0) != 0
+	ehtcap.TxLess242ToneRU = phy[5]&(1<<1) != 0
+	ehtcap.RxLess242ToneRU = phy[5]&(1<<2) != 0
+	ehtcap.PPEThresholdsPresent = phy[5]&(1<<3) != 0
+
+	switch (phy[5] >> 4) & 0x3 {
+	case 0:
+		ehtcap.CommonNominalPacketPadding = 0
+	case 1:
+		ehtcap.CommonNominalPacketPadding = 8
+	case 2:
+		ehtcap.CommonNominalPacketPadding = 16
+	case 3:
+		ehtcap.CommonNominalPacketPadding = 20
+	}
+
+	ehtcap.MaxSupportedEHTLTFs = int((phy[5]>>6)&0x3 | (phy[6]&0x7)<<2)
+	ehtcap.MCS15Support = int((phy[6] >> 3) & 0xf)
+	ehtcap.EHTDupIn6GHz = phy[6]&(1<<7) != 0
+
+	ehtcap.Support20MHzRxNDPWiderBandwidth = phy[7]&(1<<0) != 0
+	ehtcap.NonOFDMAULMUMIMO80MHz = phy[7]&(1<<1) != 0
+	ehtcap.NonOFDMAULMUMIMO160MHz = phy[7]&(1<<2) != 0
+	ehtcap.NonOFDMAULMUMIMO320MHz = phy[7]&(1<<3) != 0
+	ehtcap.MUBeamformer80MHz = phy[7]&(1<<4) != 0
+	ehtcap.MUBeamformer160MHz = phy[7]&(1<<5) != 0
+	ehtcap.MUBeamformer320MHz = phy[7]&(1<<6) != 0
+	ehtcap.TBSoundingFeedbackRateLimit = phy[7]&(1<<7) != 0
+
+	ehtcap.Rx1024QAMWiderBandwidthDLOFDMA = phy[8]&(1<<0) != 0
+	ehtcap.Rx4096QAMWiderBandwidthDLOFDMA = phy[8]&(1<<1) != 0
+}
+
+// decodeEHTMCSNSSSets parses the Supported EHT-MCS And NSS Set field
+// (NL80211_BAND_IFTYPE_ATTR_EHT_CAP_MCS_SET).  Which maps the field holds, and
+// therefore how long it is, depends on the channel widths advertised in the HE
+// PHY capabilities, on 320MHz support in the EHT PHY capabilities, and on
+// whether the interface types transmit as an access point.  See
+// ieee80211_eht_mcs_nss_size in the Linux kernel's ieee80211.h.
+func decodeEHTMCSNSSSets(mcs, hePHYCap, ehtPHYCap []byte, isAP bool) []EHTMCSNSSSet {
+	// Both capability fields are needed to make sense of the maps.
+	if len(mcs) == 0 || len(hePHYCap) == 0 || len(ehtPHYCap) == 0 {
+		return nil
+	}
+
+	// In the 2.4GHz band a device which supports 40MHz channels reports a
+	// single map, and the remaining channel width bits are reserved.
+	if hePHYCap[0]&hePHYCap040MHzIn2GHz != 0 {
+		return decodeEHTMCSMaps(mcs, ChannelWidth80)
+	}
+
+	var widths []ChannelWidth
+	if hePHYCap[0]&hePHYCap040MHz80MHzIn5GHz != 0 {
+		widths = append(widths, ChannelWidth80)
+	}
+	if hePHYCap[0]&hePHYCap0160MHzIn5GHz != 0 {
+		widths = append(widths, ChannelWidth160)
+	}
+	if ehtPHYCap[0]&ehtPHYCap0320MHzIn6GHz != 0 {
+		widths = append(widths, ChannelWidth320)
+	}
+
+	if len(widths) > 0 {
+		return decodeEHTMCSMaps(mcs, widths...)
+	}
+
+	// No channel width beyond 20MHz: an access point still reports a single
+	// map, while a station reports the wider map for 20MHz-only stations.
+	if isAP {
+		return decodeEHTMCSMaps(mcs, ChannelWidth80)
+	}
+
+	return []EHTMCSNSSSet{
+		{
+			Width:     ChannelWidth20,
+			MCSRanges: decodeEHTMCSMap(mcs, [][2]int{{0, 7}, {8, 9}, {10, 11}, {12, 13}}),
+		},
+	}
+}
+
+// decodeEHTMCSMaps parses one three byte EHT-MCS map per channel width in
+// widths, in the order the maps appear in the Supported EHT-MCS And NSS Set
+// field.
+func decodeEHTMCSMaps(mcs []byte, widths ...ChannelWidth) []EHTMCSNSSSet {
+	ranges := [][2]int{{0, 9}, {10, 11}, {12, 13}}
+
+	sets := make([]EHTMCSNSSSet, 0, len(widths))
+	for _, w := range widths {
+		if len(mcs) < ehtMCSMapLen {
+			// The kernel reported a shorter field than the
+			// capabilities call for; decode what is there.
+			break
+		}
+
+		sets = append(
+			sets, EHTMCSNSSSet{
+				Width:     w,
+				MCSRanges: decodeEHTMCSMap(mcs[:ehtMCSMapLen], ranges),
+			},
+		)
+		mcs = mcs[ehtMCSMapLen:]
+	}
+
+	if len(sets) == 0 {
+		return nil
+	}
+
+	return sets
+}
+
+// decodeEHTMCSMap parses a single EHT-MCS map, which holds one byte per range
+// of MCS indices: the low nibble is the maximum number of spatial streams for
+// reception, and the high nibble the maximum number for transmission.
+func decodeEHTMCSMap(mcs []byte, ranges [][2]int) []EHTMCSNSS {
+	n := min(len(mcs), len(ranges))
+
+	nss := make([]EHTMCSNSS, 0, n)
+	for i := range n {
+		nss = append(
+			nss, EHTMCSNSS{
+				MinMCS:   ranges[i][0],
+				MaxMCS:   ranges[i][1],
+				RxMaxNSS: int(mcs[i] & 0xf),
+				TxMaxNSS: int(mcs[i] >> 4),
+			},
+		)
+	}
+
+	return nss
 }
 
 // parseAttributes parses netlink attributes into a BSS's fields.
